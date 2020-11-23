@@ -1,13 +1,16 @@
 /*
  * TODO:
  *  - Description here
+ *
+ *  - Split stdout / stderr?
  */
 
 use clap::{Arg, App, AppSettings};
 
-use ssh2::Session;
-use std::io::prelude::*;
 use std::net::TcpStream;
+use ssh2::Session;
+
+use std::io::prelude::*;
 
 use std::thread;
 use threadpool::ThreadPool;
@@ -62,9 +65,14 @@ fn execute(remote_host: &str, command: &str, remote_user: &str) -> (String, i32)
     }
 
     let mut channel = sess.channel_session().unwrap();
+
+    channel.handle_extended_data(ssh2::ExtendedData::Merge).unwrap();
     channel.exec(command).unwrap();
+
     let mut out = String::new();
     channel.read_to_string(&mut out).unwrap();
+
+    channel.close().unwrap();
     channel.wait_close().unwrap();
 
     let exit_status = channel.exit_status().unwrap();
