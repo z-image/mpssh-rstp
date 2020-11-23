@@ -130,8 +130,10 @@ fn print_output(host: &str, out: String, exit_status: i32, host_max_width: usize
         delim = delim_text.to_string();
     }
 
+    let stdout = std::io::stdout();
+    let mut stdout_handle = stdout.lock();
     for line in text.lines() {
-        println!("{:width$} {:>4.1}% {:>5} {} {}", host, hosts_left_pct, eta_str, delim, line, width=host_max_width);
+        writeln!(&mut stdout_handle, "{:width$} {:>4.1}% {:>5} {} {}", host, hosts_left_pct, eta_str, delim, line, width=host_max_width).unwrap();
     }
 }
 
