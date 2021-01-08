@@ -36,15 +36,16 @@ fn execute(remote_host: &str, command: &str, remote_user: &str) -> (String, i32)
 
     let stream;
     let mut retr: u64 = 0;
+    let retr_limit = 3;
     loop {
         retr += 1;
         let retr_time = retr.pow(2) * 1000;
         stream = match TcpStream::connect(&remote_addr) {
             Ok(stream) => stream,
             Err(e) => {
-                eprintln!("Connection retry {} for {} in {} ms", retr, remote_host, retr_time);
+                eprintln!("Connection retry {}/{} for {} in {} ms", retr, retr_limit, remote_host, retr_time);
                 thread::sleep(time::Duration::from_millis(retr_time));
-                if retr < 3 {
+                if retr < retr_limit {
                     continue;
                 }
 
@@ -65,6 +66,7 @@ fn execute(remote_host: &str, command: &str, remote_user: &str) -> (String, i32)
     }
 
     let mut channel = sess.channel_session().unwrap();
+    // channel.request_auth_agent_forwarding().unwrap();
 
     channel.handle_extended_data(ssh2::ExtendedData::Merge).unwrap();
     channel.exec(command).unwrap();
@@ -91,9 +93,9 @@ fn calculate_progress(hosts_total: usize, hosts_left_lock: Arc::<RwLock::<usize>
         let eta = ((elapsed_secs / (100.0 as f32 - hosts_left_pct) * 100.0) - elapsed_secs) as usize;
         let eta_m = eta / 60;
         let eta_s = eta % 60;
-        eta_str = format!("{:2}m{:02}s", eta_m, eta_s);
+        eta_str = format!("{:02}m{:02}s", eta_m, eta_s);
     } else {
-        eta_str = " ?m ?s".to_string();
+        eta_str = "??m??s".to_string();
     }
 
     (hosts_left_pct, eta_str)
@@ -104,6 +106,7 @@ fn print_output(host: &str, out: String, exit_status: i32, host_max_width: usize
 
     if out.is_empty() {
         if exit_status == 0 {
+            // code duplicated bellow
             eprint!("{:>4.1}% / {:>5}\r", hosts_left_pct, eta_str);
             std::io::stderr().flush().unwrap();
             return;
@@ -133,7 +136,12 @@ fn print_output(host: &str, out: String, exit_status: i32, host_max_width: usize
     let stdout = std::io::stdout();
     let mut stdout_handle = stdout.lock();
     for line in text.lines() {
-        writeln!(&mut stdout_handle, "{:width$} {:>4.1}% {:>5} {} {}", host, hosts_left_pct, eta_str, delim, line, width=host_max_width).unwrap();
+        if !atty::is(Stream::Stdout) && atty::is(Stream::Stderr) {
+            // code duplicated above
+            eprint!("{:>4.1}% / {:>5}\r", hosts_left_pct, eta_str);
+            std::io::stderr().flush().unwrap();
+        }
+        writeln!(&mut stdout_handle, "{:width$} {:>4.1}%-{:>5}{} {}", host, hosts_left_pct, eta_str, delim, line, width=host_max_width).unwrap();
     }
 }
 
