@@ -3,6 +3,9 @@
  *  - Description here
  *
  *  - Split stdout / stderr?
+ *  - auth agent forwarding
+ *  - support tail -f
+ *  - -u mandatory?
  */
 
 use clap::{Arg, App, AppSettings};
