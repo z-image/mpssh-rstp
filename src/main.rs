@@ -4,6 +4,7 @@
  *
  *  - Split stdout / stderr?
  *  - auth agent forwarding
+ *   - maybe switch to russh?
  *  - support tail -f
  *  - -u mandatory?
  */
@@ -58,14 +59,32 @@ fn execute(remote_host: &str, command: &str, remote_user: &str) -> (String, i32)
         break;
     }
     let mut sess = Session::new().unwrap();
+
+    let mut agent = sess.agent().unwrap();
+    agent.connect().unwrap();
+    agent.list_identities().unwrap();
+
     sess.set_tcp_stream(stream);
     sess.handshake().unwrap();
-    match sess.userauth_agent(remote_user) {
-        Ok(_) => (),
-        Err(error) => {
-            eprintln!("FATAL: {}", error);
-            std::process::exit(1);
+
+    let mut agent_auth_success = false;
+    let mut agent_auth_error: String = "".to_string();
+    for identity in agent.identities().unwrap() {
+        match agent.userauth(remote_user, &identity) {
+            Ok(_) => {
+                agent_auth_success = true;
+                break;
+            },
+            Err(error) => {
+                // eprintln!("DEBUG: {}", error);
+                agent_auth_error = error.message().to_owned();
+            }
         }
+    }
+
+    if agent_auth_success == false {
+        eprintln!("FATAL: {}", agent_auth_error);
+        std::process::exit(1);
     }
 
     let mut channel = sess.channel_session().unwrap();
