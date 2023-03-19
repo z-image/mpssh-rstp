@@ -30,7 +30,7 @@ use ansi_term::Colour;
 use atty::Stream;
 
 
-const VERSION: &str = "0.7";
+const VERSION: &str = "0.8";
 const AUTHOR: &str = "Teodor Milkov <tm@del.bg>";
 
 
@@ -72,12 +72,13 @@ fn execute(remote_host: &str, command: &str, remote_user: &str) -> (String, i32)
     for identity in agent.identities().unwrap() {
         match agent.userauth(remote_user, &identity) {
             Ok(_) => {
+                log::debug!("agent success for {}", identity.comment());
                 agent_auth_success = true;
                 break;
             },
             Err(error) => {
-                // eprintln!("DEBUG: {}", error);
                 agent_auth_error = error.message().to_owned();
+                log::debug!("agent error for {}: {}", identity.comment(), agent_auth_error);
             }
         }
     }
@@ -211,7 +212,10 @@ fn process_args() -> clap::ArgMatches<'static> {
             .help("delay between each SSH session in milliseconds (ms)"))
         .arg(Arg::with_name("command")
             .takes_value(true)
-            .required(true)
+            .required(true))
+        .arg(Arg::with_name("debug")
+            .takes_value(false)
+            .long("debug")
         )
         .get_matches();
 
@@ -234,6 +238,12 @@ fn assert_enough_fds(required_fds: usize) {
 
 fn main() {
     let matches = process_args();
+
+    if matches.is_present("debug") {
+        env_logger::Builder::new().filter_level(log::LevelFilter::Debug).init();
+    } else {
+        env_logger::Builder::new().filter_level(log::LevelFilter::Info).init();
+    }
 
     let hosts_list_file = matches.value_of("file").unwrap();
     let parallel_sessions = matches.value_of("parallel").unwrap().parse::<usize>().unwrap();
