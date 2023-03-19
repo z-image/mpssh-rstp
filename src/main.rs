@@ -74,6 +74,7 @@ fn execute(remote_host: &str, command: &str, remote_user: &str) -> (String, i32)
             Ok(_) => {
                 log::debug!("agent success for {}", identity.comment());
                 agent_auth_success = true;
+                agent.disconnect().unwrap();
                 break;
             },
             Err(error) => {
@@ -222,18 +223,12 @@ fn process_args() -> clap::ArgMatches<'static> {
     matches
 }
 
-fn assert_enough_fds(required_fds: usize) {
-    let rlim_nofiles;
-
+fn get_rlim_nofiles() -> usize {
     unsafe {
         let mut rl = MaybeUninit::<libc::rlimit>::uninit();
         getrlimit(libc::RLIMIT_NOFILE, rl.as_mut_ptr());
-        rlim_nofiles = rl.assume_init().rlim_cur as usize;
-    };
-    if rlim_nofiles <= required_fds {
-        eprintln!("FATAL: Requested parallelism of {} is higher than RELIMIT_NOFILES of {}.", required_fds, rlim_nofiles);
-        std::process::exit(1);
-    }
+        rl.assume_init().rlim_cur as usize // ;
+    } // ;
 }
 
 fn main() {
@@ -262,7 +257,12 @@ fn main() {
     let hosts_total = hosts_list.len();
     let n_workers = std::cmp::min(parallel_sessions, hosts_total);
 
-    assert_enough_fds(n_workers);
+    // Each worker consumer 2 fds: 1 for ssh tcp + 1 for auth agent socket
+    let rlim_nofiles = get_rlim_nofiles();
+    if rlim_nofiles <= (n_workers*2+14) {
+        log::error!("Requested parallelism of {} needs more fds than the allowed {}.", n_workers, rlim_nofiles);
+        std::process::exit(1);
+    }
 
     let pool = ThreadPool::new(n_workers);
 
@@ -288,6 +288,7 @@ fn main() {
             set_name(&thread_name).unwrap();
 
             let (out, exit_status) = execute(&host, &command_clone, &user_clone);
+
             let (hosts_left_pct, eta_str) = calculate_progress(hosts_total, work_left_lock_clone, start_time);
             print_output(&host, out, exit_status, host_max_width, hosts_left_pct, eta_str);
             thread_name = "mps: idle".to_owned();
