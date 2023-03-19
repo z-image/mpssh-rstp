@@ -82,7 +82,7 @@ fn execute(remote_host: &str, command: &str, remote_user: &str) -> (String, i32)
         }
     }
 
-    if agent_auth_success == false {
+    if ! agent_auth_success {
         eprintln!("FATAL: {}", agent_auth_error);
         std::process::exit(1);
     }
@@ -110,33 +110,30 @@ fn calculate_progress(hosts_total: usize, hosts_left_lock: Arc::<RwLock::<usize>
     let hosts_left_pct = *hosts_left as f32 / hosts_total as f32 * 100.0;
     let elapsed_secs = start_time.elapsed().unwrap().as_secs() as f32;
 
-    let eta_str: String;
-    if hosts_left_pct <= 99.0 && elapsed_secs > 4.0 {
-        let eta = ((elapsed_secs / (100.0 as f32 - hosts_left_pct) * 100.0) - elapsed_secs) as usize;
+    let eta_str: String = if hosts_left_pct <= 99.0 && elapsed_secs > 4.0 {
+        let eta = ((elapsed_secs / (100.0 - hosts_left_pct) * 100.0) - elapsed_secs) as usize;
         let eta_m = eta / 60;
         let eta_s = eta % 60;
-        eta_str = format!("{:02}m{:02}s", eta_m, eta_s);
+        format!("{:02}m{:02}s", eta_m, eta_s) // ;
     } else {
-        eta_str = "??m??s".to_string();
-    }
+        "??m??s".to_string() // ;
+    };
 
     (hosts_left_pct, eta_str)
 }
 
 fn print_output(host: &str, out: String, exit_status: i32, host_max_width: usize, hosts_left_pct: f32, eta_str: String) {
-    let text: String;
-
-    if out.is_empty() {
+    let text: String = if out.is_empty() {
         if exit_status == 0 {
             // code duplicated bellow
             eprint!("{:>4.1}% / {:>5}\r", hosts_left_pct, eta_str);
             std::io::stderr().flush().unwrap();
             return;
         }
-        text = "\n".to_string();
+        "\n".to_string() // ;
     } else {
-        text = out;
-    }
+        out // ;
+    };
 
     let delim_text;
     let delim_ansi;
@@ -148,12 +145,11 @@ fn print_output(host: &str, out: String, exit_status: i32, host_max_width: usize
         delim_ansi = Colour::Fixed(9).paint(delim_text);
     }
 
-    let delim;
-    if atty::is(Stream::Stdout) {
-        delim = format!("{}", delim_ansi);
+    let delim = if atty::is(Stream::Stdout) {
+        format!("{}", delim_ansi) // ;
     } else {
-        delim = delim_text.to_string();
-    }
+        delim_text.to_string() // ;
+    };
 
     let stdout = std::io::stdout();
     let mut stdout_handle = stdout.lock();
