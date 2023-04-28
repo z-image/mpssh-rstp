@@ -9,30 +9,28 @@
  *  - -u mandatory?
  */
 
-use clap::{Arg, App, AppSettings};
+use clap::{App, AppSettings, Arg};
 
-use std::net::TcpStream;
 use ssh2::Session;
+use std::net::TcpStream;
 
 use std::io::prelude::*;
 
-use std::thread;
-use threadpool::ThreadPool;
-use prctl::set_name;
-use std::time;
 use libc::getrlimit;
+use prctl::set_name;
 use std::mem::MaybeUninit;
 use std::sync::{Arc, Mutex, RwLock};
+use std::thread;
+use std::time;
+use threadpool::ThreadPool;
 
-use std::fs::File;
-use std::io::BufReader;
 use ansi_term::Colour;
 use atty::Stream;
-
+use std::fs::File;
+use std::io::BufReader;
 
 const VERSION: &str = "0.8";
 const AUTHOR: &str = "Teodor Milkov <tm@del.bg>";
-
 
 fn execute(remote_host: &str, command: &str, remote_user: &str) -> (String, i32) {
     let remote_port = "22";
@@ -47,7 +45,10 @@ fn execute(remote_host: &str, command: &str, remote_user: &str) -> (String, i32)
         stream = match TcpStream::connect(&remote_addr) {
             Ok(stream) => stream,
             Err(e) => {
-                eprintln!("Connection retry {}/{} for {} in {} ms", retr, retr_limit, remote_host, retr_time);
+                eprintln!(
+                    "Connection retry {}/{} for {} in {} ms",
+                    retr, retr_limit, remote_host, retr_time
+                );
                 thread::sleep(time::Duration::from_millis(retr_time));
                 if retr < retr_limit {
                     continue;
@@ -76,7 +77,7 @@ fn execute(remote_host: &str, command: &str, remote_user: &str) -> (String, i32)
                 agent_auth_success = true;
                 agent.disconnect().unwrap();
                 break;
-            },
+            }
             Err(error) => {
                 agent_auth_error = error.message().to_owned();
                 log::debug!("agent error for {}: {}", identity.comment(), agent_auth_error);
@@ -84,7 +85,7 @@ fn execute(remote_host: &str, command: &str, remote_user: &str) -> (String, i32)
         }
     }
 
-    if ! agent_auth_success {
+    if !agent_auth_success {
         eprintln!("FATAL: {}", agent_auth_error);
         std::process::exit(1);
     }
@@ -106,7 +107,11 @@ fn execute(remote_host: &str, command: &str, remote_user: &str) -> (String, i32)
     (out, exit_status)
 }
 
-fn calculate_progress(hosts_total: usize, hosts_left_lock: Arc::<RwLock::<usize>>, start_time: std::time::SystemTime) -> (f32, String) {
+fn calculate_progress(
+    hosts_total: usize,
+    hosts_left_lock: Arc<RwLock<usize>>,
+    start_time: std::time::SystemTime,
+) -> (f32, String) {
     let mut hosts_left = hosts_left_lock.write().unwrap();
     *hosts_left -= 1;
     let hosts_left_pct = *hosts_left as f32 / hosts_total as f32 * 100.0;
@@ -124,7 +129,14 @@ fn calculate_progress(hosts_total: usize, hosts_left_lock: Arc::<RwLock::<usize>
     (hosts_left_pct, eta_str)
 }
 
-fn print_output(host: &str, out: String, exit_status: i32, host_max_width: usize, hosts_left_pct: f32, eta_str: String) {
+fn print_output(
+    host: &str,
+    out: String,
+    exit_status: i32,
+    host_max_width: usize,
+    hosts_left_pct: f32,
+    eta_str: String,
+) {
     let text: String = if out.is_empty() {
         if exit_status == 0 {
             // this code is duplicated bellow
@@ -159,7 +171,17 @@ fn print_output(host: &str, out: String, exit_status: i32, host_max_width: usize
             // this code is duplicated above
             eprint!("{:>4.1}% / {:>5}\r", hosts_left_pct, eta_str);
         }
-        writeln!(&mut stdout_handle, "{:width$} {:>4.1}%-{:>5}{} {}", host, hosts_left_pct, eta_str, delim, line, width=host_max_width).unwrap();
+        writeln!(
+            &mut stdout_handle,
+            "{:width$} {:>4.1}%-{:>5}{} {}",
+            host,
+            hosts_left_pct,
+            eta_str,
+            delim,
+            line,
+            width = host_max_width
+        )
+        .unwrap();
     }
 }
 
@@ -171,8 +193,12 @@ fn get_hosts_list(filename: &str) -> Vec<String> {
 
     for line in file.lines() {
         let line_str = line.unwrap().trim().to_owned();
-        if line_str.is_empty() { continue; }
-        if line_str.starts_with('#') { continue; }
+        if line_str.is_empty() {
+            continue;
+        }
+        if line_str.starts_with('#') {
+            continue;
+        }
         hosts_list.push(line_str);
     }
 
@@ -186,36 +212,39 @@ fn process_args() -> clap::ArgMatches<'static> {
         .about("\nExecutes an SSH command simulatenously on many hosts.")
         .setting(AppSettings::AllowExternalSubcommands)
         .setting(AppSettings::AllArgsOverrideSelf)
-        .arg(Arg::with_name("file")
-            .short("f")
-            .long("file")
-            .takes_value(true)
-            .required(true)
-            .help("file with hosts: one per line"))
-        .arg(Arg::with_name("user")
-            .short("u")
-            .long("user")
-            .takes_value(true)
-            .help("force SSH login as this username, instead of current user)"))
-        .arg(Arg::with_name("parallel")
-            .short("p")
-            .long("parallel")
-            .takes_value(true)
-            .default_value("100")
-            .help("number of parallel SSH sessions"))
-        .arg(Arg::with_name("delay")
-            .short("d")
-            .long("delay")
-            .takes_value(true)
-            .default_value("10")
-            .help("delay between each SSH session in milliseconds (ms)"))
-        .arg(Arg::with_name("command")
-            .takes_value(true)
-            .required(true))
-        .arg(Arg::with_name("debug")
-            .takes_value(false)
-            .long("debug")
+        .arg(
+            Arg::with_name("file")
+                .short("f")
+                .long("file")
+                .takes_value(true)
+                .required(true)
+                .help("file with hosts: one per line"),
         )
+        .arg(
+            Arg::with_name("user")
+                .short("u")
+                .long("user")
+                .takes_value(true)
+                .help("force SSH login as this username, instead of current user)"),
+        )
+        .arg(
+            Arg::with_name("parallel")
+                .short("p")
+                .long("parallel")
+                .takes_value(true)
+                .default_value("100")
+                .help("number of parallel SSH sessions"),
+        )
+        .arg(
+            Arg::with_name("delay")
+                .short("d")
+                .long("delay")
+                .takes_value(true)
+                .default_value("10")
+                .help("delay between each SSH session in milliseconds (ms)"),
+        )
+        .arg(Arg::with_name("command").takes_value(true).required(true))
+        .arg(Arg::with_name("debug").takes_value(false).long("debug"))
         .get_matches();
 
     matches
@@ -257,8 +286,12 @@ fn main() {
 
     // Each worker consumer 2 fds: 1 for ssh tcp + 1 for auth agent socket
     let rlim_nofiles = get_rlim_nofiles();
-    if rlim_nofiles <= (n_workers*2+14) {
-        log::error!("Requested parallelism of {} needs more fds than the allowed {}.", n_workers, rlim_nofiles);
+    if rlim_nofiles <= (n_workers * 2 + 14) {
+        log::error!(
+            "Requested parallelism of {} needs more fds than the allowed {}.",
+            n_workers,
+            rlim_nofiles
+        );
         std::process::exit(1);
     }
 
