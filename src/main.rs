@@ -22,7 +22,7 @@ use prctl::set_name;
 use std::time;
 use libc::getrlimit;
 use std::mem::MaybeUninit;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use std::fs::File;
 use std::io::BufReader;
@@ -127,9 +127,8 @@ fn calculate_progress(hosts_total: usize, hosts_left_lock: Arc::<RwLock::<usize>
 fn print_output(host: &str, out: String, exit_status: i32, host_max_width: usize, hosts_left_pct: f32, eta_str: String) {
     let text: String = if out.is_empty() {
         if exit_status == 0 {
-            // code duplicated bellow
+            // this code is duplicated bellow
             eprint!("{:>4.1}% / {:>5}\r", hosts_left_pct, eta_str);
-            std::io::stderr().flush().unwrap();
             return;
         }
         "\n".to_string() // ;
@@ -157,9 +156,8 @@ fn print_output(host: &str, out: String, exit_status: i32, host_max_width: usize
     let mut stdout_handle = stdout.lock();
     for line in text.lines() {
         if !atty::is(Stream::Stdout) && atty::is(Stream::Stderr) {
-            // code duplicated above
+            // this code is duplicated above
             eprint!("{:>4.1}% / {:>5}\r", hosts_left_pct, eta_str);
-            std::io::stderr().flush().unwrap();
         }
         writeln!(&mut stdout_handle, "{:width$} {:>4.1}%-{:>5}{} {}", host, hosts_left_pct, eta_str, delim, line, width=host_max_width).unwrap();
     }
@@ -277,10 +275,16 @@ fn main() {
     let hosts_left_lock = Arc::new(RwLock::new(hosts_total));
     let start_time = std::time::SystemTime::now();
 
+    // Prevent garbled output by ensuring only one thread can write at a time.
+    let stdout_mutex = Arc::new(Mutex::new(std::io::stdout()));
+    let stderr_mutex = Arc::new(Mutex::new(std::io::stderr()));
+
     for host in hosts_list {
         let command_clone = remote_command.clone();
         let work_left_lock_clone = hosts_left_lock.clone();
         let user_clone = remote_user.clone();
+        let stdout_mutex_clone = Arc::clone(&stdout_mutex);
+        let stderr_mutex_clone = Arc::clone(&stderr_mutex);
 
         pool.execute(move || {
             let mut thread_name = "mps: ".to_owned();
@@ -290,7 +294,13 @@ fn main() {
             let (out, exit_status) = execute(&host, &command_clone, &user_clone);
 
             let (hosts_left_pct, eta_str) = calculate_progress(hosts_total, work_left_lock_clone, start_time);
+
+            let stdout_lock = stdout_mutex_clone.lock().unwrap();
+            let stderr_lock = stderr_mutex_clone.lock().unwrap();
             print_output(&host, out, exit_status, host_max_width, hosts_left_pct, eta_str);
+            drop(stdout_lock);
+            drop(stderr_lock);
+
             thread_name = "mps: idle".to_owned();
             set_name(&thread_name).unwrap();
         });
