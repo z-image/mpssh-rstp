@@ -19,7 +19,7 @@ use std::io::prelude::*;
 use libc::getrlimit;
 use prctl::set_name;
 use std::mem::MaybeUninit;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time;
 use threadpool::ThreadPool;
@@ -109,10 +109,10 @@ fn execute(remote_host: &str, command: &str, remote_user: &str) -> (String, i32)
 
 fn calculate_progress(
     hosts_total: usize,
-    hosts_left_lock: Arc<RwLock<usize>>,
+    hosts_left_lock: Arc<Mutex<usize>>,
     start_time: std::time::SystemTime,
 ) -> (f32, String) {
-    let mut hosts_left = hosts_left_lock.write().unwrap();
+    let mut hosts_left = hosts_left_lock.lock().unwrap();
     *hosts_left -= 1;
     let hosts_left_pct = *hosts_left as f32 / hosts_total as f32 * 100.0;
     let elapsed_secs = start_time.elapsed().unwrap().as_secs() as f32;
@@ -305,7 +305,7 @@ fn main() {
 
     let host_max_width: usize = hosts_list.iter().max_by(|x, y| x.len().cmp(&y.len())).unwrap().len();
 
-    let hosts_left_lock = Arc::new(RwLock::new(hosts_total));
+    let hosts_left_lock = Arc::new(Mutex::new(hosts_total));
     let start_time = std::time::SystemTime::now();
 
     // Prevent garbled output by ensuring only one thread can write at a time.
