@@ -19,7 +19,10 @@ use std::io::prelude::*;
 use libc::getrlimit;
 use prctl::set_name;
 use std::mem::MaybeUninit;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, Mutex,
+};
 use std::thread;
 use std::time;
 use threadpool::ThreadPool;
@@ -29,7 +32,7 @@ use atty::Stream;
 use std::fs::File;
 use std::io::BufReader;
 
-const VERSION: &str = "0.8";
+const VERSION: &str = "0.85";
 const AUTHOR: &str = "Teodor Milkov <tm@del.bg>";
 
 fn execute(remote_host: &str, command: &str, remote_user: &str) -> (String, i32) {
@@ -111,17 +114,37 @@ fn calculate_progress(
     hosts_total: usize,
     hosts_left_lock: Arc<Mutex<usize>>,
     start_time: std::time::SystemTime,
+    completion_times: &Arc<Mutex<Vec<std::time::Duration>>>,
+    active_threads: &Arc<AtomicUsize>,
 ) -> (f32, String) {
     let mut hosts_left = hosts_left_lock.lock().unwrap();
     *hosts_left -= 1;
     let hosts_left_pct = *hosts_left as f32 / hosts_total as f32 * 100.0;
     let elapsed_secs = start_time.elapsed().unwrap().as_secs() as f32;
 
+    let completion_times = completion_times.lock().unwrap();
+    let mut sum_weights = 1;
+
+    let mut weighted_sum = std::time::Duration::ZERO;
+    for (i, &time) in completion_times.iter().enumerate() {
+        let weight = (i.pow(2)) as u32;
+        sum_weights += weight;
+        weighted_sum += time * weight;
+    }
+
+    let active_threads_count = active_threads.load(Ordering::SeqCst);
+
+    let avg_time_per_thread = weighted_sum / sum_weights;
+
     let eta_str: String = if hosts_left_pct <= 99.0 && elapsed_secs > 4.0 {
-        let eta = ((elapsed_secs / (100.0 - hosts_left_pct) * 100.0) - elapsed_secs) as usize;
-        let eta_m = eta / 60;
-        let eta_s = eta % 60;
-        format!("{:02}m{:02}s", eta_m, eta_s) // ;
+        let eta_wma = (avg_time_per_thread.as_secs_f32() * *hosts_left as f32) / active_threads_count as f32;
+        let eta_div = *hosts_left as f32 / ((hosts_total - *hosts_left) as f32 / elapsed_secs);
+        let eta = (eta_wma + eta_div) / 2.0;
+        let eta_m = eta as u32 / 60;
+        let eta_s = eta % 60.0;
+
+        // format!("{:02}m{:02.0}s({:2.1}|{:2.1})", eta_m, eta_s, eta_wma, eta_div)
+        format!("{:02}m{:02.0}s", eta_m, eta_s) // ;
     } else {
         "??m??s".to_string() // ;
     };
@@ -306,6 +329,8 @@ fn main() {
     let host_max_width: usize = hosts_list.iter().max_by(|x, y| x.len().cmp(&y.len())).unwrap().len();
 
     let hosts_left_lock = Arc::new(Mutex::new(hosts_total));
+    let completion_times = Arc::new(Mutex::new(Vec::<std::time::Duration>::with_capacity(hosts_list.len())));
+    let active_threads = Arc::new(AtomicUsize::new(0));
     let start_time = std::time::SystemTime::now();
 
     // Prevent garbled output by ensuring only one thread can write at a time.
@@ -315,6 +340,8 @@ fn main() {
     for host in hosts_list {
         let command_clone = remote_command.clone();
         let work_left_lock_clone = hosts_left_lock.clone();
+        let completion_times_clone = Arc::clone(&completion_times);
+        let active_threads_clone = active_threads.clone();
         let user_clone = remote_user.clone();
         let stdout_mutex_clone = Arc::clone(&stdout_mutex);
         let stderr_mutex_clone = Arc::clone(&stderr_mutex);
@@ -324,9 +351,20 @@ fn main() {
             thread_name.push_str(&host);
             set_name(&thread_name).unwrap();
 
-            let (out, exit_status) = execute(&host, &command_clone, &user_clone);
+            active_threads_clone.fetch_add(1, Ordering::SeqCst);
 
-            let (hosts_left_pct, eta_str) = calculate_progress(hosts_total, work_left_lock_clone, start_time);
+            let thread_start = std::time::Instant::now();
+            let (out, exit_status) = execute(&host, &command_clone, &user_clone); // SSH
+            let thread_elapsed = thread_start.elapsed();
+            completion_times_clone.lock().unwrap().push(thread_elapsed);
+
+            let (hosts_left_pct, eta_str) = calculate_progress(
+                hosts_total,
+                work_left_lock_clone,
+                start_time,
+                &completion_times_clone,
+                &active_threads_clone,
+            );
 
             let stdout_lock = stdout_mutex_clone.lock().unwrap();
             let stderr_lock = stderr_mutex_clone.lock().unwrap();
@@ -336,6 +374,8 @@ fn main() {
 
             thread_name = "mps: idle".to_owned();
             set_name(&thread_name).unwrap();
+
+            active_threads_clone.fetch_sub(1, Ordering::SeqCst);
         });
 
         thread::sleep(time::Duration::from_millis(delay));
