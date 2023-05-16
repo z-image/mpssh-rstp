@@ -32,7 +32,9 @@ use atty::Stream;
 use std::fs::File;
 use std::io::BufReader;
 
-const VERSION: &str = "0.85";
+use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+
+const VERSION: &str = "0.86";
 const AUTHOR: &str = "Teodor Milkov <tm@del.bg>";
 
 fn execute(remote_host: &str, command: &str, remote_user: &str) -> (String, i32) {
@@ -135,6 +137,12 @@ fn calculate_progress(
     let active_threads_count = active_threads.load(Ordering::SeqCst);
 
     let avg_time_per_thread = weighted_sum / sum_weights;
+    tracing::debug!(
+        "avg_time_per_thread {:?}, active_threads {}, hosts_left {}",
+        avg_time_per_thread,
+        active_threads_count,
+        hosts_left
+    );
 
     let eta_str: String = if hosts_left_pct <= 99.0 && elapsed_secs > 4.0 {
         let eta_wma = (avg_time_per_thread.as_secs_f32() * *hosts_left as f32) / active_threads_count as f32;
@@ -282,13 +290,13 @@ fn get_rlim_nofiles() -> usize {
 }
 
 fn main() {
-    let matches = process_args();
+    // TODO: turn ansi off only if stdout/stderr is not terminal
+    tracing_subscriber::registry()
+        .with(fmt::layer().with_ansi(false))
+        .with(EnvFilter::from_default_env())
+        .init();
 
-    if matches.is_present("debug") {
-        env_logger::Builder::new().filter_level(log::LevelFilter::Debug).init();
-    } else {
-        env_logger::Builder::new().filter_level(log::LevelFilter::Info).init();
-    }
+    let matches = process_args();
 
     let hosts_list_file = matches.value_of("file").unwrap();
     let parallel_sessions = matches.value_of("parallel").unwrap().parse::<usize>().unwrap();
@@ -346,6 +354,7 @@ fn main() {
         let stdout_mutex_clone = Arc::clone(&stdout_mutex);
         let stderr_mutex_clone = Arc::clone(&stderr_mutex);
 
+        tracing::debug!("active_count {}", pool.active_count());
         pool.execute(move || {
             let mut thread_name = "mps: ".to_owned();
             thread_name.push_str(&host);
