@@ -1,7 +1,9 @@
 /*
  * TODO:
  *  - Description here
- *
+ *  - Maybe create separate printing thread?
+ *   - Print progress at most once per X msec.
+ *  - Check known_hosts
  *  - Split stdout / stderr?
  *  - auth agent forwarding
  *   - maybe switch to russh?
@@ -67,11 +69,39 @@ fn execute(remote_host: &str, command: &str, remote_user: &str) -> (String, i32)
     let mut sess = Session::new().unwrap();
 
     let mut agent = sess.agent().unwrap();
-    agent.connect().unwrap();
-    agent.list_identities().unwrap();
+    retr = 0;
+    loop {
+        agent.connect().unwrap();
+
+        match agent.list_identities() {
+            Ok(_) => break,
+            Err(_) if retr < retr_limit => {
+                retr += 1;
+                let retr_time = retr.pow(2) * 1000;
+                log::warn!(
+                    "agent.list_identities() will retry {}/{} for {} in {} ms",
+                    retr,
+                    retr_limit,
+                    remote_host,
+                    retr_time
+                );
+                agent.disconnect().unwrap();
+                thread::sleep(time::Duration::from_millis(retr_time));
+            }
+            Err(e) => {
+                panic!("Failed after {} attempts: {:?}", retr_limit, e)
+            }
+        }
+    }
 
     sess.set_tcp_stream(stream);
-    sess.handshake().unwrap();
+    // TODO: implement retries
+    match sess.handshake() {
+        Ok(_) => {}
+        Err(e) => {
+            log::error!("handshake() for {}: {:?}", remote_host, e);
+        }
+    }
 
     let mut agent_auth_success = false;
     let mut agent_auth_error: String = "".to_string();
@@ -85,13 +115,13 @@ fn execute(remote_host: &str, command: &str, remote_user: &str) -> (String, i32)
             }
             Err(error) => {
                 agent_auth_error = error.message().to_owned();
-                log::debug!("agent error for {}: {}", identity.comment(), agent_auth_error);
+                log::error!("agent failure for {}: {}", identity.comment(), agent_auth_error);
             }
         }
     }
 
     if !agent_auth_success {
-        eprintln!("FATAL: {}", agent_auth_error);
+        log::error!("fatal failure {} for {}", agent_auth_error, remote_host);
         std::process::exit(1);
     }
 
