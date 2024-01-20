@@ -247,7 +247,7 @@ fn print_output(
             // this code is duplicated above
             eprint!("{:>4.1}% / {:>5}\r", hosts_left_pct, eta_str);
         }
-        writeln!(
+        let write_result = writeln!(
             &mut stdout_handle,
             "{:width$} {:>4.1}%-{:>5}{} {}",
             host,
@@ -256,8 +256,12 @@ fn print_output(
             delim,
             line,
             width = host_max_width
-        )
-        .unwrap();
+        );
+
+        if let Err(e) = write_result {
+            log::error!("Failed to write to stdout: {}", e);
+            panic!("Error writing to stdout: {}", e);
+        }
     }
 }
 
