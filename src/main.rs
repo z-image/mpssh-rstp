@@ -95,11 +95,26 @@ fn execute(remote_host: &str, command: &str, remote_user: &str) -> (String, i32)
     }
 
     sess.set_tcp_stream(stream);
-    // TODO: implement retries
-    match sess.handshake() {
-        Ok(_) => {}
-        Err(e) => {
-            log::error!("handshake() for {}: {:?}", remote_host, e);
+
+    retr = 0;
+    loop {
+        match sess.handshake() {
+            Ok(_) => break,
+            Err(_) if retr < retr_limit => {
+                retr += 1;
+                let retr_time = retr.pow(2) * 1000; // 1000, 4000, 9000, ... ms
+                log::warn!(
+                    "handshake() will retry {}/{} for {} in {} ms",
+                    retr,
+                    retr_limit,
+                    remote_host,
+                    retr_time
+                );
+                thread::sleep(time::Duration::from_millis(retr_time));
+            }
+            Err(e) => {
+                panic!("Failed after {} attempts for {}: {:?}", retr_limit, remote_host, e)
+            }
         }
     }
 
