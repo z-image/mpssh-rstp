@@ -341,7 +341,7 @@ fn get_rlim_nofiles() -> usize {
 fn main() {
     // TODO: turn ansi off only if stdout/stderr is not terminal
     tracing_subscriber::registry()
-        .with(fmt::layer().with_ansi(false))
+        .with(fmt::layer().with_ansi(false).with_writer(std::io::stderr))
         .with(EnvFilter::from_default_env())
         .init();
 
