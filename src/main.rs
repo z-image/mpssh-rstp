@@ -1,8 +1,7 @@
 /*
  * TODO:
  *  - Description here
- *  - Maybe create separate printing thread?
- *   - Print progress at most once per X msec.
+ *  - Move progress calculation to the print thread
  *  - Check known_hosts
  *  - Split stdout / stderr?
  *  - auth agent forwarding
@@ -23,6 +22,7 @@ use prctl::set_name;
 use std::mem::MaybeUninit;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
+    mpsc,
     Arc, Mutex,
 };
 use std::thread;
@@ -36,7 +36,7 @@ use std::io::BufReader;
 
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-const VERSION: &str = "0.86";
+const VERSION: &str = "0.90";
 const AUTHOR: &str = "Teodor Milkov <tm@del.bg>";
 
 fn execute(remote_host: &str, command: &str, remote_user: &str) -> (String, i32) {
@@ -345,6 +345,43 @@ fn main() {
         .with(EnvFilter::from_default_env())
         .init();
 
+    // Create a channel for communication with the print thread.
+    let (tx, rx) = mpsc::channel::<(String, String, i32, usize, f32, String)>();
+
+    // Create the print thread.
+    let _print_thread = thread::spawn(move || {
+        let mut last_print_time = std::time::Instant::now();
+
+        let update_ms = 250;
+        loop {
+            let msg = rx.recv_timeout(time::Duration::from_millis(update_ms));
+            match msg {
+                Ok(msg) => {
+                    let (host, out, exit_status, host_max_width, hosts_left_pct, eta_str) = msg;
+                    if out.is_empty() {
+                        if last_print_time.elapsed().as_millis() < update_ms.into() {
+                            continue;
+                        }
+                        last_print_time = std::time::Instant::now();
+                    }
+                    // print_output() will panic if stdout is closed (e.g. piped to head)
+                    print_output(&host, out, exit_status, host_max_width, hosts_left_pct, eta_str);
+                }
+                // Do nothing if timeout or disconnected - this is expected.
+                // These are the only variants in the enum RecvTimeoutError, so
+                // no need for _.
+                Err(e) => match e {
+                    mpsc::RecvTimeoutError::Timeout => {
+                        // eprintln!("D: print thread timeout");
+                    },
+                    mpsc::RecvTimeoutError::Disconnected => {
+                        // eprintln!("D: print thread disconnected");
+                    },
+                },
+            }
+        }
+    });
+
     let matches = process_args();
 
     let hosts_list_file = matches.value_of("file").unwrap();
@@ -402,6 +439,7 @@ fn main() {
         let user_clone = remote_user.clone();
         let stdout_mutex_clone = Arc::clone(&stdout_mutex);
         let stderr_mutex_clone = Arc::clone(&stderr_mutex);
+        let tx_clone = tx.clone();
 
         tracing::debug!("active_count {}", pool.active_count());
         pool.execute(move || {
@@ -427,17 +465,10 @@ fn main() {
             let stdout_lock = stdout_mutex_clone.lock().unwrap();
             let stderr_lock = stderr_mutex_clone.lock().unwrap();
 
-            // Catch panics in print_output.
-            let _print_result = std::panic::catch_unwind(|| {
-                print_output(
-                    &host,
-                    out,
-                    exit_status,
-                    host_max_width,
-                    hosts_left_pct,
-                    eta_str,
-                );
-            });
+            // Send output to the print thread.
+            let _tx_result = tx_clone.send(
+                (host.clone(), out.clone(), exit_status, host_max_width, hosts_left_pct, eta_str.clone())
+            );
 
             drop(stdout_lock);
             drop(stderr_lock);
