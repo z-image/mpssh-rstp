@@ -426,7 +426,19 @@ fn main() {
 
             let stdout_lock = stdout_mutex_clone.lock().unwrap();
             let stderr_lock = stderr_mutex_clone.lock().unwrap();
-            print_output(&host, out, exit_status, host_max_width, hosts_left_pct, eta_str);
+
+            // Catch panics in print_output.
+            let _print_result = std::panic::catch_unwind(|| {
+                print_output(
+                    &host,
+                    out,
+                    exit_status,
+                    host_max_width,
+                    hosts_left_pct,
+                    eta_str,
+                );
+            });
+
             drop(stdout_lock);
             drop(stderr_lock);
 
