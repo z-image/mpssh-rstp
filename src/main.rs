@@ -2,6 +2,7 @@
  * TODO:
  *  - Description here
  *  - Move progress calculation to the print thread
+ *  - Redirect per host output to files
  *  - Check known_hosts
  *  - Split stdout / stderr?
  *  - auth agent forwarding
@@ -22,8 +23,7 @@ use prctl::set_name;
 use std::mem::MaybeUninit;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    mpsc,
-    Arc, Mutex,
+    mpsc, Arc, Mutex,
 };
 use std::thread;
 use std::time;
@@ -113,7 +113,10 @@ fn execute(remote_host: &str, command: &str, remote_user: &str) -> (String, i32)
                 thread::sleep(time::Duration::from_millis(retr_time));
             }
             Err(e) => {
-                panic!("Failed after {} attempts for {}: {:?}", retr_limit, remote_host, e)
+                panic!(
+                    "Failed after {} attempts for {}: {:?}",
+                    retr_limit, remote_host, e
+                )
             }
         }
     }
@@ -130,7 +133,11 @@ fn execute(remote_host: &str, command: &str, remote_user: &str) -> (String, i32)
             }
             Err(error) => {
                 agent_auth_error = error.message().to_owned();
-                log::error!("agent failure for {}: {}", identity.comment(), agent_auth_error);
+                log::error!(
+                    "agent failure for {}: {}",
+                    identity.comment(),
+                    agent_auth_error
+                );
             }
         }
     }
@@ -143,7 +150,9 @@ fn execute(remote_host: &str, command: &str, remote_user: &str) -> (String, i32)
     let mut channel = sess.channel_session().unwrap();
     // channel.request_auth_agent_forwarding().unwrap();
 
-    channel.handle_extended_data(ssh2::ExtendedData::Merge).unwrap();
+    channel
+        .handle_extended_data(ssh2::ExtendedData::Merge)
+        .unwrap();
     channel.exec(command).unwrap();
 
     let mut out = String::new();
@@ -190,7 +199,8 @@ fn calculate_progress(
     );
 
     let eta_str: String = if hosts_left_pct <= 99.0 && elapsed_secs > 4.0 {
-        let eta_wma = (avg_time_per_thread.as_secs_f32() * *hosts_left as f32) / active_threads_count as f32;
+        let eta_wma =
+            (avg_time_per_thread.as_secs_f32() * *hosts_left as f32) / active_threads_count as f32;
         let eta_div = *hosts_left as f32 / ((hosts_total - *hosts_left) as f32 / elapsed_secs);
         let eta = (eta_wma + eta_div) / 2.0;
         let eta_m = eta as u32 / 60;
@@ -364,8 +374,16 @@ fn main() {
                         }
                         last_print_time = std::time::Instant::now();
                     }
+
                     // print_output() will panic if stdout is closed (e.g. piped to head)
-                    print_output(&host, out, exit_status, host_max_width, hosts_left_pct, eta_str);
+                    print_output(
+                        &host,
+                        out,
+                        exit_status,
+                        host_max_width,
+                        hosts_left_pct,
+                        eta_str,
+                    );
                 }
                 // Do nothing if timeout or disconnected - this is expected.
                 // These are the only variants in the enum RecvTimeoutError, so
@@ -373,10 +391,10 @@ fn main() {
                 Err(e) => match e {
                     mpsc::RecvTimeoutError::Timeout => {
                         // eprintln!("D: print thread timeout");
-                    },
+                    }
                     mpsc::RecvTimeoutError::Disconnected => {
                         // eprintln!("D: print thread disconnected");
-                    },
+                    }
                 },
             }
         }
@@ -385,7 +403,11 @@ fn main() {
     let matches = process_args();
 
     let hosts_list_file = matches.value_of("file").unwrap();
-    let parallel_sessions = matches.value_of("parallel").unwrap().parse::<usize>().unwrap();
+    let parallel_sessions = matches
+        .value_of("parallel")
+        .unwrap()
+        .parse::<usize>()
+        .unwrap();
     let delay = matches.value_of("delay").unwrap().parse::<u64>().unwrap();
     let remote_command = matches.value_of("command").unwrap().to_owned();
     let mut remote_user = matches.value_of("user").unwrap().to_owned();
@@ -420,10 +442,16 @@ fn main() {
     eprintln!(" * {} ms delay", delay);
     eprintln!(" * command: {}\n", remote_command);
 
-    let host_max_width: usize = hosts_list.iter().max_by(|x, y| x.len().cmp(&y.len())).unwrap().len();
+    let host_max_width: usize = hosts_list
+        .iter()
+        .max_by(|x, y| x.len().cmp(&y.len()))
+        .unwrap()
+        .len();
 
     let hosts_left_lock = Arc::new(Mutex::new(hosts_total));
-    let completion_times = Arc::new(Mutex::new(Vec::<std::time::Duration>::with_capacity(hosts_list.len())));
+    let completion_times = Arc::new(Mutex::new(Vec::<std::time::Duration>::with_capacity(
+        hosts_list.len(),
+    )));
     let active_threads = Arc::new(AtomicUsize::new(0));
     let start_time = std::time::SystemTime::now();
 
@@ -466,9 +494,14 @@ fn main() {
             let stderr_lock = stderr_mutex_clone.lock().unwrap();
 
             // Send output to the print thread.
-            let _tx_result = tx_clone.send(
-                (host.clone(), out.clone(), exit_status, host_max_width, hosts_left_pct, eta_str.clone())
-            );
+            let _tx_result = tx_clone.send((
+                host.clone(),
+                out.clone(),
+                exit_status,
+                host_max_width,
+                hosts_left_pct,
+                eta_str.clone(),
+            ));
 
             drop(stdout_lock);
             drop(stderr_lock);
