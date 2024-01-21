@@ -333,6 +333,13 @@ fn process_args() -> clap::ArgMatches<'static> {
                 .default_value("10")
                 .help("delay between each SSH session in milliseconds (ms)"),
         )
+        .arg(
+            Arg::with_name("write_to_file")
+                .short("w")
+                .long("write-to-file")
+                .takes_value(false)
+                .help("Write output to files, one per host"),
+        )
         .arg(Arg::with_name("command").takes_value(true).required(true))
         .arg(Arg::with_name("debug").takes_value(false).long("debug"))
         .get_matches();
@@ -346,6 +353,25 @@ fn get_rlim_nofiles() -> usize {
         getrlimit(libc::RLIMIT_NOFILE, rl.as_mut_ptr());
         rl.assume_init().rlim_cur as usize // ;
     } // ;
+}
+
+fn ensure_dir_is_clean_and_writable() {
+    // No files starting with mpssh-* should exist in the current directory.
+    // This is racey, but we just don't want to start the program at all if
+    // there are files starting with mpssh-*. Will fail later if we can't create.
+    for entry in std::fs::read_dir(".").unwrap() {
+        let filename = entry.unwrap().file_name().into_string().unwrap();
+        if filename.starts_with("mpssh-") {
+            log::error!("Files mpssh-* already exist in the current directory.");
+            std::process::exit(1);
+        }
+    }
+
+    // Ensure we can write to the current directory.
+    let test_filename = "mpssh-test-file";
+    let mut file = File::create(test_filename).unwrap();
+    file.write_all(b"test").unwrap();
+    std::fs::remove_file(test_filename).unwrap();
 }
 
 fn main() {
@@ -372,6 +398,11 @@ fn main() {
             Some(username) => username.into_string().unwrap(),
             None => panic!("The current user does not exist!"),
         };
+    }
+
+    let write_to_file = matches.is_present("write_to_file");
+    if write_to_file {
+        ensure_dir_is_clean_and_writable();
     }
 
     let hosts_list = get_hosts_list(hosts_list_file);
@@ -401,7 +432,33 @@ fn main() {
             let msg = rx.recv_timeout(time::Duration::from_millis(update_ms));
             match msg {
                 Ok(msg) => {
-                    let (host, out, exit_status, host_max_width, hosts_left_pct, eta_str) = msg;
+                    let (host, mut out, exit_status, host_max_width, hosts_left_pct, eta_str) = msg;
+
+                    if write_to_file && !out.is_empty() {
+                        let filename = format!("mpssh-{}.out", host);
+
+                        // Bail out if the file already exists. Checking existence is racey,
+                        // so we just try to open it and fail if it exists.
+                        let mut file = match File::create(&filename) {
+                            Ok(file) => file,
+                            Err(e) => {
+                                log::error!("Failed to create file {}: {}", filename, e);
+                                continue;
+                            }
+                        };
+
+                        // Write to file and sync to disk. File is closed on drop (end of scope).
+                        {
+                            file.write_all(out.as_bytes()).unwrap();
+                            // rust silently ignores errors on close, so - sync
+                            file.sync_all().unwrap();
+                        }
+
+                        // delete out, so that it is not printed, but we still
+                        // have the progress
+                        out = String::new();
+                    }
+
                     if out.is_empty() {
                         if last_print_time.elapsed().as_millis() < update_ms.into() {
                             continue;
