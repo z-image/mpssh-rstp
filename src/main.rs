@@ -355,6 +355,40 @@ fn main() {
         .with(EnvFilter::from_default_env())
         .init();
 
+    let matches = process_args();
+
+    let hosts_list_file = matches.value_of("file").unwrap();
+    let parallel_sessions = matches
+        .value_of("parallel")
+        .unwrap()
+        .parse::<usize>()
+        .unwrap();
+    let delay = matches.value_of("delay").unwrap().parse::<u64>().unwrap();
+    let remote_command = matches.value_of("command").unwrap().to_owned();
+    let mut remote_user = matches.value_of("user").unwrap().to_owned();
+
+    if remote_user.is_empty() {
+        remote_user = match users::get_current_username() {
+            Some(username) => username.into_string().unwrap(),
+            None => panic!("The current user does not exist!"),
+        };
+    }
+
+    let hosts_list = get_hosts_list(hosts_list_file);
+    let hosts_total = hosts_list.len();
+    let n_workers = std::cmp::min(parallel_sessions, hosts_total);
+
+    // Each worker consumer 2 fds: 1 for ssh tcp + 1 for auth agent socket
+    let rlim_nofiles = get_rlim_nofiles();
+    if rlim_nofiles <= (n_workers * 2 + 14) {
+        log::error!(
+            "Requested parallelism of {} needs more fds than the allowed {}.",
+            n_workers,
+            rlim_nofiles
+        );
+        std::process::exit(1);
+    }
+
     // Create a channel for communication with the print thread.
     let (tx, rx) = mpsc::channel::<(String, String, i32, usize, f32, String)>();
 
@@ -399,40 +433,6 @@ fn main() {
             }
         }
     });
-
-    let matches = process_args();
-
-    let hosts_list_file = matches.value_of("file").unwrap();
-    let parallel_sessions = matches
-        .value_of("parallel")
-        .unwrap()
-        .parse::<usize>()
-        .unwrap();
-    let delay = matches.value_of("delay").unwrap().parse::<u64>().unwrap();
-    let remote_command = matches.value_of("command").unwrap().to_owned();
-    let mut remote_user = matches.value_of("user").unwrap().to_owned();
-
-    if remote_user.is_empty() {
-        remote_user = match users::get_current_username() {
-            Some(username) => username.into_string().unwrap(),
-            None => panic!("The current user does not exist!"),
-        };
-    }
-
-    let hosts_list = get_hosts_list(hosts_list_file);
-    let hosts_total = hosts_list.len();
-    let n_workers = std::cmp::min(parallel_sessions, hosts_total);
-
-    // Each worker consumer 2 fds: 1 for ssh tcp + 1 for auth agent socket
-    let rlim_nofiles = get_rlim_nofiles();
-    if rlim_nofiles <= (n_workers * 2 + 14) {
-        log::error!(
-            "Requested parallelism of {} needs more fds than the allowed {}.",
-            n_workers,
-            rlim_nofiles
-        );
-        std::process::exit(1);
-    }
 
     let pool = ThreadPool::new(n_workers);
 
