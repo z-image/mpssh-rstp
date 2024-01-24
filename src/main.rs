@@ -24,8 +24,8 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
     mpsc, Arc, Mutex,
 };
-use std::time;
 use std::thread;
+use std::time;
 use threadpool::ThreadPool;
 
 use ansi_term::Colour;
@@ -359,11 +359,9 @@ fn spawn_print_thread(
                     );
                 }
 
-                Err(e) => match e {
-                    _ => {
-                        log::error!("Error receiving from channel: {}", e);
-                    }
-                },
+                Err(e) => {
+                    log::error!("Error receiving from channel: {}", e);
+                }
             }
         }
     });
