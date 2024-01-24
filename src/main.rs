@@ -1,7 +1,6 @@
 /*
  * TODO:
  *  - Description here
- *  - Move progress calculation to the print thread
  *  - Redirect per host output to files
  *  - Check known_hosts
  *  - Split stdout / stderr?
@@ -512,18 +511,12 @@ fn main() {
     let active_threads = Arc::new(AtomicUsize::new(0));
     let start_time = std::time::SystemTime::now();
 
-    // Prevent garbled output by ensuring only one thread can write at a time.
-    let stdout_mutex = Arc::new(Mutex::new(std::io::stdout()));
-    let stderr_mutex = Arc::new(Mutex::new(std::io::stderr()));
-
     for host in hosts_list {
         let command_clone = remote_command.clone();
         let work_left_lock_clone = hosts_left_lock.clone();
         let completion_times_clone = Arc::clone(&completion_times);
         let active_threads_clone = active_threads.clone();
         let user_clone = remote_user.clone();
-        let stdout_mutex_clone = Arc::clone(&stdout_mutex);
-        let stderr_mutex_clone = Arc::clone(&stderr_mutex);
         let tx_clone = tx.clone();
 
         tracing::debug!("active_count {}", pool.active_count());
@@ -547,9 +540,6 @@ fn main() {
                 &active_threads_clone,
             );
 
-            let stdout_lock = stdout_mutex_clone.lock().unwrap();
-            let stderr_lock = stderr_mutex_clone.lock().unwrap();
-
             // Send output to the print thread.
             let _tx_result = tx_clone.send((
                 host.clone(),
@@ -559,9 +549,6 @@ fn main() {
                 hosts_left_pct,
                 eta_str.clone(),
             ));
-
-            drop(stdout_lock);
-            drop(stderr_lock);
 
             thread_name = "mps: idle".to_owned();
             set_name(&thread_name).unwrap();
