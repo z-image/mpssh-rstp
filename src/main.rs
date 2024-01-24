@@ -1,6 +1,13 @@
 /*
+ * Mass parallel SSH in Rust
+ * (c) 2020 Teodor Milkov <tm@lifepattern.org>
+ *
+ * License: MPL-2.0
+ * https://www.mozilla.org/en-US/MPL/2.0/
+ *
+ * See --help for usage.
+ *
  * TODO:
- *  - Description here
  *  - Move progress calculation to the print thread
  *  - Check known_hosts
  *  - Split stdout / stderr?
