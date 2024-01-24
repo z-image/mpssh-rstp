@@ -8,7 +8,6 @@
  * See --help for usage.
  *
  * TODO:
- *  - Move progress calculation to the print thread
  *  - Check known_hosts
  *  - Split stdout / stderr?
  *  - auth agent forwarding
@@ -29,7 +28,7 @@ use prctl::set_name;
 use std::mem::MaybeUninit;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    mpsc, Arc, Mutex,
+    mpsc, Arc,
 };
 use std::thread;
 use std::time;
@@ -46,7 +45,7 @@ const VERSION: &str = "0.90";
 const AUTHOR: &str = "Teodor Milkov <tm@del.bg>";
 
 const PROGRESS_UPDATE_MS: u128 = 250;
-const THREAD_EXIT_CODE: f32 = -999.0;
+const SIGNAL_THREAD_EXIT: i32 = 999;
 
 fn execute(remote_host: &str, command: &str, remote_user: &str) -> (String, i32) {
     let remote_port = "22";
@@ -177,17 +176,16 @@ fn execute(remote_host: &str, command: &str, remote_user: &str) -> (String, i32)
 
 fn calculate_progress(
     hosts_total: usize,
-    hosts_left_lock: Arc<Mutex<usize>>,
+    mut hosts_left: usize,
     start_time: std::time::SystemTime,
-    completion_times: &Arc<Mutex<Vec<std::time::Duration>>>,
-    active_threads: &Arc<AtomicUsize>,
-) -> (f32, String) {
-    let mut hosts_left = hosts_left_lock.lock().unwrap();
-    *hosts_left -= 1;
-    let hosts_left_pct = *hosts_left as f32 / hosts_total as f32 * 100.0;
+    completion_times: &[std::time::Duration],
+    active_threads_count: usize,
+) -> (usize, f32, String) {
+    hosts_left -= 1;
+
+    let hosts_left_pct = hosts_left as f32 / hosts_total as f32 * 100.0;
     let elapsed_secs = start_time.elapsed().unwrap().as_secs() as f32;
 
-    let completion_times = completion_times.lock().unwrap();
     let mut sum_weights = 1;
 
     let mut weighted_sum = std::time::Duration::ZERO;
@@ -196,8 +194,6 @@ fn calculate_progress(
         sum_weights += weight;
         weighted_sum += time * weight;
     }
-
-    let active_threads_count = active_threads.load(Ordering::SeqCst);
 
     let avg_time_per_thread = weighted_sum / sum_weights;
     tracing::debug!(
@@ -209,8 +205,8 @@ fn calculate_progress(
 
     let eta_str: String = if hosts_left_pct <= 99.0 && elapsed_secs > 4.0 {
         let eta_wma =
-            (avg_time_per_thread.as_secs_f32() * *hosts_left as f32) / active_threads_count as f32;
-        let eta_div = *hosts_left as f32 / ((hosts_total - *hosts_left) as f32 / elapsed_secs);
+            (avg_time_per_thread.as_secs_f32() * hosts_left as f32) / active_threads_count as f32;
+        let eta_div = hosts_left as f32 / ((hosts_total - hosts_left) as f32 / elapsed_secs);
         let eta = (eta_wma + eta_div) / 2.0;
         let eta_m = eta as u32 / 60;
         let eta_s = eta % 60.0;
@@ -221,7 +217,7 @@ fn calculate_progress(
         "??m??s".to_string() // ;
     };
 
-    (hosts_left_pct, eta_str)
+    (hosts_left, hosts_left_pct, eta_str)
 }
 
 fn print_output(
@@ -285,24 +281,29 @@ fn print_output(
 }
 
 fn spawn_print_thread(
-    rx: mpsc::Receiver<(String, String, i32, usize, f32, String)>,
+    rx: mpsc::Receiver<(String, String, i32, time::Duration, usize)>,
     write_to_file: bool,
     suppress_output: bool,
+    hosts_total: usize,
+    host_max_width: usize,
 ) -> thread::JoinHandle<()> {
     let print_thread = thread::spawn(move || {
         let mut last_print_time = std::time::Instant::now();
-
         let update_ms: u128 = PROGRESS_UPDATE_MS;
+        let start_time = std::time::SystemTime::now();
+        let mut hosts_left = hosts_total;
+        let mut completion_times = Vec::<std::time::Duration>::new();
+
         loop {
             match rx.recv() {
                 Ok(msg) => {
-                    let (host, mut out, exit_status, host_max_width, hosts_left_pct, eta_str) = msg;
+                    let (host, mut out, exit_status, thread_elapsed, active_threads) = msg;
 
                     // Exit if the print thread receives the exit code from the
                     // main thread. This is a hack, but exiting is the only
                     // signal we currently need. May create a dedicated messaing
                     // argument or channel if needed in the future.
-                    if hosts_left_pct == THREAD_EXIT_CODE {
+                    if exit_status == SIGNAL_THREAD_EXIT {
                         break;
                     }
 
@@ -354,6 +355,18 @@ fn spawn_print_thread(
                         }
                         last_print_time = std::time::Instant::now();
                     }
+
+                    completion_times.push(thread_elapsed);
+
+                    // Calculate progress and ETA by calling:
+                    let (hosts_left_updated, hosts_left_pct, eta_str) = calculate_progress(
+                        hosts_total,
+                        hosts_left,
+                        start_time,
+                        &completion_times,
+                        active_threads,
+                    );
+                    hosts_left = hosts_left_updated;
 
                     // print_output() will panic if stdout is closed (e.g. piped to head)
                     print_output(
@@ -529,12 +542,24 @@ fn main() {
     }
 
     // Create a channel for communication with the print thread.
-    let (tx, rx) = mpsc::channel::<(String, String, i32, usize, f32, String)>();
+    let (tx, rx) = mpsc::channel::<(String, String, i32, time::Duration, usize)>();
 
     let suppress_output = matches.is_present("suppress_output");
 
+    let host_max_width: usize = hosts_list
+        .iter()
+        .max_by(|x, y| x.len().cmp(&y.len()))
+        .unwrap()
+        .len();
+
     // Create the print thread.
-    let print_thread = spawn_print_thread(rx, write_to_file, suppress_output);
+    let print_thread = spawn_print_thread(
+        rx,
+        write_to_file,
+        suppress_output,
+        hosts_total,
+        host_max_width,
+    );
 
     let pool = ThreadPool::new(n_workers);
 
@@ -544,23 +569,10 @@ fn main() {
     eprintln!(" * {} ms delay", delay);
     eprintln!(" * command: {}\n", remote_command);
 
-    let host_max_width: usize = hosts_list
-        .iter()
-        .max_by(|x, y| x.len().cmp(&y.len()))
-        .unwrap()
-        .len();
-
-    let hosts_left_lock = Arc::new(Mutex::new(hosts_total));
-    let completion_times = Arc::new(Mutex::new(Vec::<std::time::Duration>::with_capacity(
-        hosts_list.len(),
-    )));
     let active_threads = Arc::new(AtomicUsize::new(0));
-    let start_time = std::time::SystemTime::now();
 
     for host in hosts_list {
         let command_clone = remote_command.clone();
-        let work_left_lock_clone = hosts_left_lock.clone();
-        let completion_times_clone = Arc::clone(&completion_times);
         let active_threads_clone = active_threads.clone();
         let user_clone = remote_user.clone();
         let tx_clone = tx.clone();
@@ -576,24 +588,14 @@ fn main() {
             let thread_start = std::time::Instant::now();
             let (out, exit_status) = execute(&host, &command_clone, &user_clone); // SSH
             let thread_elapsed = thread_start.elapsed();
-            completion_times_clone.lock().unwrap().push(thread_elapsed);
-
-            let (hosts_left_pct, eta_str) = calculate_progress(
-                hosts_total,
-                work_left_lock_clone,
-                start_time,
-                &completion_times_clone,
-                &active_threads_clone,
-            );
 
             // Send output to the print thread.
             match tx_clone.send((
                 host.clone(),
                 out,
                 exit_status,
-                host_max_width,
-                hosts_left_pct,
-                eta_str,
+                thread_elapsed,
+                active_threads_clone.load(Ordering::SeqCst),
             )) {
                 Ok(_) => {
                     log::debug!("Sent to print thread: {}", host);
@@ -619,10 +621,9 @@ fn main() {
     tx.send((
         "".to_string(),
         "".to_string(),
+        SIGNAL_THREAD_EXIT,
+        time::Duration::from_secs(0),
         0,
-        0,
-        THREAD_EXIT_CODE,
-        "".to_string(),
     ))
     .unwrap();
 
