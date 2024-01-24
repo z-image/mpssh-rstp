@@ -569,6 +569,10 @@ fn main() {
     eprintln!(" * {} ms delay", delay);
     eprintln!(" * command: {}\n", remote_command);
 
+    // XXX: There was a reason to maintain my own counter, instead of using the
+    // pool's active_count(), but I can't remember it now.
+    // TODO: Consider revisiting the logic to evaluate if pool.active_count()
+    // could be sufficient now.
     let active_threads = Arc::new(AtomicUsize::new(0));
 
     for host in hosts_list {
