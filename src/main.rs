@@ -1,7 +1,7 @@
 /*
  * TODO:
  *  - Description here
- *  - Redirect per host output to files
+ *  - Move progress calculation to the print thread
  *  - Check known_hosts
  *  - Split stdout / stderr?
  *  - auth agent forwarding
@@ -24,8 +24,8 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
     mpsc, Arc, Mutex,
 };
-use std::thread;
 use std::time;
+use std::thread;
 use threadpool::ThreadPool;
 
 use ansi_term::Colour;
@@ -37,6 +37,9 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 const VERSION: &str = "0.90";
 const AUTHOR: &str = "Teodor Milkov <tm@del.bg>";
+
+const PROGRESS_UPDATE_MS: u128 = 250;
+const THREAD_EXIT_CODE: f32 = -999.0;
 
 fn execute(remote_host: &str, command: &str, remote_user: &str) -> (String, i32) {
     let remote_port = "22";
@@ -274,6 +277,100 @@ fn print_output(
     }
 }
 
+fn spawn_print_thread(
+    rx: mpsc::Receiver<(String, String, i32, usize, f32, String)>,
+    write_to_file: bool,
+    suppress_output: bool,
+) -> thread::JoinHandle<()> {
+    let print_thread = thread::spawn(move || {
+        let mut last_print_time = std::time::Instant::now();
+
+        let update_ms: u128 = PROGRESS_UPDATE_MS;
+        loop {
+            match rx.recv() {
+                Ok(msg) => {
+                    let (host, mut out, exit_status, host_max_width, hosts_left_pct, eta_str) = msg;
+
+                    // Exit if the print thread receives the exit code from the
+                    // main thread. This is a hack, but exiting is the only
+                    // signal we currently need. May create a dedicated messaing
+                    // argument or channel if needed in the future.
+                    if hosts_left_pct == THREAD_EXIT_CODE {
+                        break;
+                    }
+
+                    // Write to file if requested and there is output.
+                    if write_to_file && !out.is_empty() {
+                        let filename = format!("mpssh-{}.out", host);
+
+                        // Currently all of hosts' output is buffered in memory,
+                        // so no need to append later.
+
+                        // Bail out if the file already exists. Checking existence is racey,
+                        // so we just try to open it and fail if it exists.
+                        let mut file = match File::create(&filename) {
+                            Ok(file) => file,
+                            Err(e) => {
+                                log::error!("Failed to create file {}: {}", filename, e);
+                                continue;
+                            }
+                        };
+
+                        // Write to file and sync to disk. File is closed on drop (end of scope).
+                        {
+                            match file.write_all(out.as_bytes()) {
+                                Ok(_) => {}
+                                Err(e) => {
+                                    log::error!("Failed to write to file {}: {}", filename, e);
+                                }
+                            }
+                            match file.sync_all() {
+                                Ok(_) => {}
+                                Err(e) => {
+                                    log::error!("Failed to sync file {}: {}", filename, e);
+                                }
+                            }
+                        }
+                    }
+
+                    // Clear the output, so it's not printed to stdout, but
+                    // still sent to the print thread, so it can print progress.
+                    if suppress_output {
+                        out = String::new();
+                    }
+
+                    // Rate limit progress updates if there is no output. Still
+                    // remote output will be printed as it arrives.
+                    if out.is_empty() {
+                        if last_print_time.elapsed().as_millis() < update_ms {
+                            continue;
+                        }
+                        last_print_time = std::time::Instant::now();
+                    }
+
+                    // print_output() will panic if stdout is closed (e.g. piped to head)
+                    print_output(
+                        &host,
+                        out,
+                        exit_status,
+                        host_max_width,
+                        hosts_left_pct,
+                        eta_str,
+                    );
+                }
+
+                Err(e) => match e {
+                    _ => {
+                        log::error!("Error receiving from channel: {}", e);
+                    }
+                },
+            }
+        }
+    });
+
+    print_thread
+}
+
 fn get_hosts_list(filename: &str) -> Vec<String> {
     let mut hosts_list = Vec::new();
 
@@ -331,6 +428,13 @@ fn process_args() -> clap::ArgMatches<'static> {
                 .takes_value(true)
                 .default_value("10")
                 .help("delay between each SSH session in milliseconds (ms)"),
+        )
+        .arg(
+            Arg::with_name("suppress_output")
+                .short("s")
+                .long("suppress-output")
+                .takes_value(false)
+                .help("Suppress output from the remote command (only show progress)"),
         )
         .arg(
             Arg::with_name("write_to_file")
@@ -422,73 +526,10 @@ fn main() {
     // Create a channel for communication with the print thread.
     let (tx, rx) = mpsc::channel::<(String, String, i32, usize, f32, String)>();
 
+    let suppress_output = matches.is_present("suppress_output");
+
     // Create the print thread.
-    let _print_thread = thread::spawn(move || {
-        let mut last_print_time = std::time::Instant::now();
-
-        let update_ms = 250;
-        loop {
-            let msg = rx.recv_timeout(time::Duration::from_millis(update_ms));
-            match msg {
-                Ok(msg) => {
-                    let (host, mut out, exit_status, host_max_width, hosts_left_pct, eta_str) = msg;
-
-                    if write_to_file && !out.is_empty() {
-                        let filename = format!("mpssh-{}.out", host);
-
-                        // Bail out if the file already exists. Checking existence is racey,
-                        // so we just try to open it and fail if it exists.
-                        let mut file = match File::create(&filename) {
-                            Ok(file) => file,
-                            Err(e) => {
-                                log::error!("Failed to create file {}: {}", filename, e);
-                                continue;
-                            }
-                        };
-
-                        // Write to file and sync to disk. File is closed on drop (end of scope).
-                        {
-                            file.write_all(out.as_bytes()).unwrap();
-                            // rust silently ignores errors on close, so - sync
-                            file.sync_all().unwrap();
-                        }
-
-                        // delete out, so that it is not printed, but we still
-                        // have the progress
-                        out = String::new();
-                    }
-
-                    if out.is_empty() {
-                        if last_print_time.elapsed().as_millis() < update_ms.into() {
-                            continue;
-                        }
-                        last_print_time = std::time::Instant::now();
-                    }
-
-                    // print_output() will panic if stdout is closed (e.g. piped to head)
-                    print_output(
-                        &host,
-                        out,
-                        exit_status,
-                        host_max_width,
-                        hosts_left_pct,
-                        eta_str,
-                    );
-                }
-                // Do nothing if timeout or disconnected - this is expected.
-                // These are the only variants in the enum RecvTimeoutError, so
-                // no need for _.
-                Err(e) => match e {
-                    mpsc::RecvTimeoutError::Timeout => {
-                        // eprintln!("D: print thread timeout");
-                    }
-                    mpsc::RecvTimeoutError::Disconnected => {
-                        // eprintln!("D: print thread disconnected");
-                    }
-                },
-            }
-        }
-    });
+    let print_thread = spawn_print_thread(rx, write_to_file, suppress_output);
 
     let pool = ThreadPool::new(n_workers);
 
@@ -541,14 +582,22 @@ fn main() {
             );
 
             // Send output to the print thread.
-            let _tx_result = tx_clone.send((
+            match tx_clone.send((
                 host.clone(),
-                out.clone(),
+                out,
                 exit_status,
                 host_max_width,
                 hosts_left_pct,
-                eta_str.clone(),
-            ));
+                eta_str,
+            )) {
+                Ok(_) => {
+                    log::debug!("Sent to print thread: {}", host);
+                }
+                Err(e) => {
+                    log::error!("Failed to send to print thread: {}", e);
+                    panic!("Failed to send to print thread: {}", e);
+                }
+            };
 
             thread_name = "mps: idle".to_owned();
             set_name(&thread_name).unwrap();
@@ -560,4 +609,17 @@ fn main() {
     }
 
     pool.join();
+
+    // Tell the print thread to exit.
+    tx.send((
+        "".to_string(),
+        "".to_string(),
+        0,
+        0,
+        THREAD_EXIT_CODE,
+        "".to_string(),
+    ))
+    .unwrap();
+
+    print_thread.join().unwrap();
 }
