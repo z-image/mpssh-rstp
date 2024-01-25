@@ -528,6 +528,13 @@ fn main() {
 
     let hosts_list = get_hosts_list(hosts_list_file);
     let hosts_total = hosts_list.len();
+
+    // Terminate early if there are no hosts.
+    if hosts_total == 0 {
+        log::error!("No hosts in the list.");
+        std::process::exit(1);
+    }
+
     let n_workers = std::cmp::min(parallel_sessions, hosts_total);
 
     // Each worker consumer 2 fds: 1 for ssh tcp + 1 for auth agent socket
