@@ -496,13 +496,29 @@ fn ensure_dir_is_clean_and_writable() {
 }
 
 fn main() {
-    // TODO: turn ansi off only if stdout/stderr is not terminal
-    tracing_subscriber::registry()
-        .with(fmt::layer().with_ansi(false).with_writer(std::io::stderr))
-        .with(EnvFilter::from_default_env())
-        .init();
-
     let matches = process_args();
+
+    let level = if matches.is_present("debug") {
+        String::from("debug")
+    } else {
+        std::env::var("RUST_LOG").unwrap_or_else(|_| String::from("info"))
+    };
+
+    let filter = EnvFilter::try_new(level).unwrap_or_else(|e| {
+        eprintln!("Error parsing RUST_LOG: {}", e);
+        std::process::exit(1);
+    });
+
+    let is_terminal = atty::is(Stream::Stdout) && atty::is(Stream::Stderr);
+
+    tracing_subscriber::registry()
+        .with(
+            fmt::layer()
+                .with_ansi(is_terminal)
+                .with_writer(std::io::stderr),
+        )
+        .with(filter)
+        .init();
 
     let hosts_list_file = matches.value_of("file").unwrap();
     let parallel_sessions = matches
