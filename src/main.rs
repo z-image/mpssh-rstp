@@ -69,7 +69,8 @@ fn execute(remote_host: &str, command: &str, remote_user: &str) -> (String, i32)
                     continue;
                 }
 
-                panic!("Connection ERROR: {:#?}", e);
+                log::error!("Connection ERROR: {:#?}", e);
+                return (String::new(), 1);
             }
         };
         break;
@@ -97,7 +98,8 @@ fn execute(remote_host: &str, command: &str, remote_user: &str) -> (String, i32)
                 thread::sleep(time::Duration::from_millis(retr_time));
             }
             Err(e) => {
-                panic!("Failed after {} attempts: {:?}", retr_limit, e)
+                log::error!("Failed after {} attempts: {:?}", retr_limit, e);
+                return (String::new(), 1);
             }
         }
     }
@@ -121,10 +123,8 @@ fn execute(remote_host: &str, command: &str, remote_user: &str) -> (String, i32)
                 thread::sleep(time::Duration::from_millis(retr_time));
             }
             Err(e) => {
-                panic!(
-                    "Failed after {} attempts for {}: {:?}",
-                    retr_limit, remote_host, e
-                )
+                log::error!("Failed after {} attempts for {}: {:?}", retr_limit, remote_host, e);
+                return (String::new(), 1);
             }
         }
     }
@@ -152,7 +152,7 @@ fn execute(remote_host: &str, command: &str, remote_user: &str) -> (String, i32)
 
     if !agent_auth_success {
         log::error!("fatal failure {} for {}", agent_auth_error, remote_host);
-        std::process::exit(1);
+        return (String::new(), 1);
     }
 
     let mut channel = sess.channel_session().unwrap();
@@ -347,15 +347,6 @@ fn spawn_print_thread(
                         out = String::new();
                     }
 
-                    // Rate limit progress updates if there is no output. Still
-                    // remote output will be printed as it arrives.
-                    if out.is_empty() {
-                        if last_print_time.elapsed().as_millis() < update_ms {
-                            continue;
-                        }
-                        last_print_time = std::time::Instant::now();
-                    }
-
                     completion_times.push(thread_elapsed);
 
                     // Calculate progress and ETA by calling:
@@ -367,6 +358,15 @@ fn spawn_print_thread(
                         active_threads,
                     );
                     hosts_left = hosts_left_updated;
+
+                    // Rate limit progress updates if there is no output. Still
+                    // remote output will be printed as it arrives.
+                    if out.is_empty() {
+                        if last_print_time.elapsed().as_millis() < update_ms {
+                            continue;
+                        }
+                        last_print_time = std::time::Instant::now();
+                    }
 
                     // print_output() will panic if stdout is closed (e.g. piped to head)
                     print_output(
