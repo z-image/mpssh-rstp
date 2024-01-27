@@ -8,7 +8,7 @@
  * See --help for usage.
  *
  * TODO:
- *  - Check known_hosts
+ *  - Add option to add host keys to known_hosts
  *  - Split stdout / stderr?
  *  - auth agent forwarding
  *   - maybe switch to russh?
@@ -26,6 +26,7 @@ use std::io::prelude::*;
 use libc::getrlimit;
 use prctl::set_name;
 use std::mem::MaybeUninit;
+use std::path::Path;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     mpsc, Arc,
@@ -81,6 +82,41 @@ where
     }
 }
 
+fn check_known_host(session: &ssh2::Session, host: &str) -> Result<(), std::io::Error> {
+    let mut known_hosts = session.known_hosts().unwrap();
+
+    // Initialize the known hosts with a global known hosts file
+    let file = Path::new(&std::env::var("HOME").unwrap()).join(".ssh/known_hosts");
+    known_hosts.read_file(&file, ssh2::KnownHostFileKind::OpenSSH).unwrap();
+
+    // Check if the host is known
+    let (key, _key_type) = session.host_key().unwrap();
+    match known_hosts.check(host, key) {
+        ssh2::CheckResult::Match => Ok(()),
+        ssh2::CheckResult::NotFound => {
+            log::error!("{} not found in known_hosts", host);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "host not found in known_hosts",
+            ))
+        },
+        ssh2::CheckResult::Mismatch => {
+            log::error!("{} key mismatch in known_hosts", host);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "host key mismatch in known_hosts",
+            ))
+        },
+        ssh2::CheckResult::Failure => {
+            log::error!("{} check failed", host);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "host check failed",
+            ))
+        },
+    }
+}    
+
 fn execute(remote_host: &str, command: &str, remote_user: &str) -> (String, i32) {
     let remote_port = "22";
     let remote_addr = remote_host.to_owned() + ":" + remote_port;
@@ -129,6 +165,11 @@ fn execute(remote_host: &str, command: &str, remote_user: &str) -> (String, i32)
         Err(_) => {
             return (String::new(), 1);
         }
+    }
+
+    // Check the public key of the remote host.
+    if check_known_host(&sess, remote_host).is_err() {
+        return (String::new(), 1);
     }
 
     // Try to authenticate with the first identity in the agent.
