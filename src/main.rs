@@ -42,7 +42,7 @@ use std::io::BufReader;
 
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-const VERSION: &str = "0.90";
+const VERSION: &str = "0.92";
 const AUTHOR: &str = "Teodor Milkov <tm@del.bg>";
 
 const PROGRESS_UPDATE_MS: u128 = 250;
@@ -87,7 +87,11 @@ fn check_known_host(session: &ssh2::Session, host: &str) -> Result<(), std::io::
 
     // Initialize the known hosts with a global known hosts file
     let file = Path::new(&std::env::var("HOME").unwrap()).join(".ssh/known_hosts");
-    known_hosts.read_file(&file, ssh2::KnownHostFileKind::OpenSSH).unwrap();
+    known_hosts
+        .read_file(&file, ssh2::KnownHostFileKind::OpenSSH)
+        .unwrap();
+
+    log::debug!("{} host key: {:?}", host, session.host_key().unwrap());
 
     // Check if the host is known
     let (key, _key_type) = session.host_key().unwrap();
@@ -99,23 +103,23 @@ fn check_known_host(session: &ssh2::Session, host: &str) -> Result<(), std::io::
                 std::io::ErrorKind::NotFound,
                 "host not found in known_hosts",
             ))
-        },
+        }
         ssh2::CheckResult::Mismatch => {
             log::error!("{} key mismatch in known_hosts", host);
             Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "host key mismatch in known_hosts",
             ))
-        },
+        }
         ssh2::CheckResult::Failure => {
             log::error!("{} check failed", host);
             Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 "host check failed",
             ))
-        },
+        }
     }
-}    
+}
 
 fn execute(remote_host: &str, command: &str, remote_user: &str) -> (String, i32) {
     let remote_port = "22";
@@ -150,10 +154,19 @@ fn execute(remote_host: &str, command: &str, remote_user: &str) -> (String, i32)
             }
         }
     };
-    retry(agent_identities, "agent.list_identities() for ", remote_host).unwrap();
+    retry(
+        agent_identities,
+        "agent.list_identities() for ",
+        remote_host,
+    )
+    .unwrap();
 
     // Attach the TCP stream to the SSH session.
     sess.set_tcp_stream(stream);
+
+    // TODO: get the host key type from the known_hosts file and set it as preferred
+    sess.method_pref(ssh2::MethodType::HostKey, "ssh-ed25519")
+        .unwrap();
 
     // Perform the SSH handshake.
     match retry(
@@ -166,6 +179,15 @@ fn execute(remote_host: &str, command: &str, remote_user: &str) -> (String, i32)
             return (String::new(), 1);
         }
     }
+
+    log::debug!(
+        "SSH supported algorithms: {:?}",
+        sess.supported_algs(ssh2::MethodType::HostKey)
+    );
+    log::debug!(
+        "SSH active methods: {:?}",
+        sess.methods(ssh2::MethodType::HostKey)
+    );
 
     // Check the public key of the remote host.
     if check_known_host(&sess, remote_host).is_err() {
