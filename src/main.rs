@@ -47,88 +47,91 @@ const AUTHOR: &str = "Teodor Milkov <tm@del.bg>";
 const PROGRESS_UPDATE_MS: u128 = 250;
 const SIGNAL_THREAD_EXIT: i32 = 999;
 
+fn retry<T, F, E>(mut operation: F, op_name: &str, op_arg: &str) -> Result<T, E>
+where
+    F: FnMut() -> Result<T, E>,
+    E: std::fmt::Display,
+{
+    let delay_base_ms = 1000;
+    let limit = 4;
+    let mut attempt = 0;
+
+    loop {
+        attempt += 1;
+
+        match operation() {
+            Ok(result) => return Ok(result),
+            Err(e) => {
+                if attempt >= limit {
+                    log::error!("{op_name}{op_arg} failure {attempt}/{limit}: {e}");
+                    return Err(e);
+                }
+
+                // Quadratic backoff: 1s, 4s, 9s, ...
+                let retry_delay_ms = delay_base_ms * (attempt * attempt);
+
+                log::warn!(
+                    "{op_name}{op_arg} error {attempt}/{limit}, will retry in {}s",
+                    retry_delay_ms / 1000
+                );
+
+                thread::sleep(time::Duration::from_millis(retry_delay_ms));
+            }
+        }
+    }
+}
+
 fn execute(remote_host: &str, command: &str, remote_user: &str) -> (String, i32) {
     let remote_port = "22";
     let remote_addr = remote_host.to_owned() + ":" + remote_port;
 
-    let stream;
-    let mut retr: u64 = 0;
-    let retr_limit = 3;
-    loop {
-        retr += 1;
-        let retr_time = retr.pow(2) * 1000;
-        stream = match TcpStream::connect(&remote_addr) {
-            Ok(stream) => stream,
-            Err(e) => {
-                eprintln!(
-                    "Connection retry {}/{} for {} in {} ms",
-                    retr, retr_limit, remote_host, retr_time
-                );
-                thread::sleep(time::Duration::from_millis(retr_time));
-                if retr < retr_limit {
-                    continue;
-                }
+    // Create a TCP connection to the remote host.
+    let stream = match retry(
+        || TcpStream::connect(&remote_addr),
+        "TCP connection to ",
+        remote_addr.as_str(),
+    ) {
+        Ok(stream) => stream,
+        Err(_) => {
+            return (String::new(), 1);
+        }
+    };
 
-                log::error!("Connection ERROR: {:#?}", e);
-                return (String::new(), 1);
-            }
-        };
-        break;
-    }
+    // Create a new SSH session.
     let mut sess = Session::new().unwrap();
 
+    // Create a new SSH agent session.
     let mut agent = sess.agent().unwrap();
-    retr = 0;
-    loop {
-        agent.connect().unwrap();
 
+    // Connect to the agent and request a list of identities.
+    let agent_identities = || {
+        agent.connect().unwrap();
         match agent.list_identities() {
-            Ok(_) => break,
-            Err(_) if retr < retr_limit => {
-                retr += 1;
-                let retr_time = retr.pow(2) * 1000;
-                log::warn!(
-                    "agent.list_identities() will retry {}/{} for {} in {} ms",
-                    retr,
-                    retr_limit,
-                    remote_host,
-                    retr_time
-                );
-                agent.disconnect().unwrap();
-                thread::sleep(time::Duration::from_millis(retr_time));
-            }
+            Ok(_) => Ok(()),
             Err(e) => {
-                log::error!("Failed after {} attempts: {:?}", retr_limit, e);
-                return (String::new(), 1);
+                agent.disconnect().unwrap();
+                Err(e)
             }
         }
-    }
+    };
+    retry(agent_identities, "agent.list_identities() for ", remote_host).unwrap();
 
+    // Attach the TCP stream to the SSH session.
     sess.set_tcp_stream(stream);
 
-    retr = 0;
-    loop {
-        match sess.handshake() {
-            Ok(_) => break,
-            Err(_) if retr < retr_limit => {
-                retr += 1;
-                let retr_time = retr.pow(2) * 1000; // 1000, 4000, 9000, ... ms
-                log::warn!(
-                    "handshake() will retry {}/{} for {} in {} ms",
-                    retr,
-                    retr_limit,
-                    remote_host,
-                    retr_time
-                );
-                thread::sleep(time::Duration::from_millis(retr_time));
-            }
-            Err(e) => {
-                log::error!("Failed after {} attempts for {}: {:?}", retr_limit, remote_host, e);
-                return (String::new(), 1);
-            }
+    // Perform the SSH handshake.
+    match retry(
+        || sess.handshake(),
+        "SSH handshake to ",
+        remote_addr.as_str(),
+    ) {
+        Ok(_) => {}
+        Err(_) => {
+            return (String::new(), 1);
         }
     }
 
+    // Try to authenticate with the first identity in the agent.
     let mut agent_auth_success = false;
     let mut agent_auth_error: String = "".to_string();
     for identity in agent.identities().unwrap() {
@@ -155,12 +158,16 @@ fn execute(remote_host: &str, command: &str, remote_user: &str) -> (String, i32)
         return (String::new(), 1);
     }
 
+    // Create the SSH channel.
     let mut channel = sess.channel_session().unwrap();
+    // TODO: agent forwarding
     // channel.request_auth_agent_forwarding().unwrap();
 
     channel
         .handle_extended_data(ssh2::ExtendedData::Merge)
         .unwrap();
+
+    // Execute command on the remote host.
     channel.exec(command).unwrap();
 
     let mut out = String::new();
