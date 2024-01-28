@@ -168,14 +168,13 @@ fn execute(remote_host: &str, command: &str, remote_user: &str) -> (String, i32)
     sess.method_pref(ssh2::MethodType::HostKey, "ssh-ed25519")
         .unwrap();
 
-    // Perform the SSH handshake.
-    match retry(
-        || sess.handshake(),
-        "SSH handshake to ",
-        remote_addr.as_str(),
-    ) {
+    // Attempt SSH handshake.
+    // Maybe it's just me, but retries aren't playing nice (libssh2/rust bindings?).
+    // Adopting a "fail fast, log, and sigh" approach for now.
+    match sess.handshake() {
         Ok(_) => {}
-        Err(_) => {
+        Err(e) => {
+            log::error!("SSH handshake failure: {}", e);
             return (String::new(), 1);
         }
     }
