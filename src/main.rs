@@ -42,10 +42,9 @@ use std::io::BufReader;
 
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-const VERSION: &str = "0.92";
+const VERSION: &str = "0.93";
 const AUTHOR: &str = "Teodor Milkov <tm@del.bg>";
 
-const PROGRESS_UPDATE_MS: u128 = 250;
 const SIGNAL_THREAD_EXIT: i32 = 999;
 
 fn retry<T, F, E>(mut operation: F, op_name: &str, op_arg: &str) -> Result<T, E>
@@ -121,7 +120,7 @@ fn check_known_host(session: &ssh2::Session, host: &str) -> Result<(), std::io::
     }
 }
 
-fn execute(remote_host: &str, command: &str, remote_user: &str) -> (String, i32) {
+fn execute(remote_host: &str, command: &str, remote_user: &str) -> (Option<String>, i32) {
     let remote_port = "22";
     let remote_addr = remote_host.to_owned() + ":" + remote_port;
 
@@ -133,7 +132,7 @@ fn execute(remote_host: &str, command: &str, remote_user: &str) -> (String, i32)
     ) {
         Ok(stream) => stream,
         Err(_) => {
-            return (String::new(), 1);
+            return (None, 1);
         }
     };
 
@@ -175,7 +174,7 @@ fn execute(remote_host: &str, command: &str, remote_user: &str) -> (String, i32)
         Ok(_) => {}
         Err(e) => {
             log::error!("SSH handshake failure: {}", e);
-            return (String::new(), 1);
+            return (None, 1);
         }
     }
 
@@ -190,7 +189,7 @@ fn execute(remote_host: &str, command: &str, remote_user: &str) -> (String, i32)
 
     // Check the public key of the remote host.
     if check_known_host(&sess, remote_host).is_err() {
-        return (String::new(), 1);
+        return (None, 1);
     }
 
     // Try to authenticate with the first identity in the agent.
@@ -217,7 +216,7 @@ fn execute(remote_host: &str, command: &str, remote_user: &str) -> (String, i32)
 
     if !agent_auth_success {
         log::error!("fatal failure {} for {}", agent_auth_error, remote_host);
-        return (String::new(), 1);
+        return (None, 1);
     }
 
     // Create the SSH channel.
@@ -240,7 +239,7 @@ fn execute(remote_host: &str, command: &str, remote_user: &str) -> (String, i32)
 
     let exit_status = channel.exit_status().unwrap();
 
-    (out, exit_status)
+    (Some(out), exit_status)
 }
 
 fn calculate_progress(
@@ -350,15 +349,13 @@ fn print_output(
 }
 
 fn spawn_print_thread(
-    rx: mpsc::Receiver<(String, String, i32, time::Duration, usize)>,
+    rx: mpsc::Receiver<(String, Option<String>, i32, time::Duration, usize)>,
     write_to_file: bool,
     suppress_output: bool,
     hosts_total: usize,
     host_max_width: usize,
 ) -> thread::JoinHandle<()> {
     let print_thread = thread::spawn(move || {
-        let mut last_print_time = std::time::Instant::now();
-        let update_ms: u128 = PROGRESS_UPDATE_MS;
         let start_time = std::time::SystemTime::now();
         let mut hosts_left = hosts_total;
         let mut completion_times = Vec::<std::time::Duration>::new();
@@ -377,7 +374,7 @@ fn spawn_print_thread(
                     }
 
                     // Write to file if requested and there is output.
-                    if write_to_file && !out.is_empty() {
+                    if write_to_file && out.is_some() {
                         let filename = format!("mpssh-{}.out", host);
 
                         // Currently all of hosts' output is buffered in memory,
@@ -395,17 +392,14 @@ fn spawn_print_thread(
 
                         // Write to file and sync to disk. File is closed on drop (end of scope).
                         {
-                            match file.write_all(out.as_bytes()) {
-                                Ok(_) => {}
-                                Err(e) => {
+                            if let Some(ref output) = out {
+                                if let Err(e) = file.write_all(output.as_bytes()) {
                                     log::error!("Failed to write to file {}: {}", filename, e);
                                 }
                             }
-                            match file.sync_all() {
-                                Ok(_) => {}
-                                Err(e) => {
-                                    log::error!("Failed to sync file {}: {}", filename, e);
-                                }
+
+                            if let Err(e) = file.sync_all() {
+                                log::error!("Failed to sync file {}: {}", filename, e);
                             }
                         }
                     }
@@ -413,7 +407,7 @@ fn spawn_print_thread(
                     // Clear the output, so it's not printed to stdout, but
                     // still sent to the print thread, so it can print progress.
                     if suppress_output {
-                        out = String::new();
+                        out.take();
                     }
 
                     completion_times.push(thread_elapsed);
@@ -428,19 +422,10 @@ fn spawn_print_thread(
                     );
                     hosts_left = hosts_left_updated;
 
-                    // Rate limit progress updates if there is no output. Still
-                    // remote output will be printed as it arrives.
-                    if out.is_empty() {
-                        if last_print_time.elapsed().as_millis() < update_ms {
-                            continue;
-                        }
-                        last_print_time = std::time::Instant::now();
-                    }
-
                     // print_output() will panic if stdout is closed (e.g. piped to head)
                     print_output(
                         &host,
-                        out,
+                        out.as_deref().unwrap_or("").to_string(),
                         exit_status,
                         host_max_width,
                         hosts_left_pct,
@@ -634,7 +619,7 @@ fn main() {
     }
 
     // Create a channel for communication with the print thread.
-    let (tx, rx) = mpsc::channel::<(String, String, i32, time::Duration, usize)>();
+    let (tx, rx) = mpsc::channel::<(String, Option<String>, i32, time::Duration, usize)>();
 
     let suppress_output = matches.is_present("suppress_output");
 
@@ -716,7 +701,7 @@ fn main() {
     // Tell the print thread to exit.
     tx.send((
         "".to_string(),
-        "".to_string(),
+        None,
         SIGNAL_THREAD_EXIT,
         time::Duration::from_secs(0),
         0,
