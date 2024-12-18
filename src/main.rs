@@ -248,10 +248,11 @@ fn calculate_progress(
     hosts_total: usize,
     mut hosts_left: usize,
     start_time: std::time::SystemTime,
-    completion_times: &[std::time::Duration],
+    completion_times: &(Vec<std::time::Duration>, time::Instant),
     active_threads_count: usize,
+    hosts_processed: usize,
 ) -> (usize, f32, String) {
-    hosts_left -= 1;
+    hosts_left -= hosts_processed;
 
     let hosts_left_pct = hosts_left as f32 / hosts_total as f32 * 100.0;
     let elapsed_secs = start_time.elapsed().unwrap().as_secs() as f32;
@@ -259,30 +260,86 @@ fn calculate_progress(
     let mut sum_weights = 1;
 
     let mut weighted_sum = std::time::Duration::ZERO;
-    for (i, &time) in completion_times.iter().enumerate() {
+    for (i, &time) in completion_times.0.iter().enumerate() {
         let weight = (i.pow(2)) as u32;
         sum_weights += weight;
         weighted_sum += time * weight;
     }
 
-    let avg_time_per_thread = weighted_sum / sum_weights;
+    // If the last completion time was more than 2 seconds ago, it's possible
+    // that there are still some slow hosts left blocking (long tail
+    // distribution). In this case, we add an additional (fake) weight/time.
+    let last_completion_secs_ago = completion_times.1.elapsed().as_secs_f32();
+    log::debug!(
+        "elapsed_secs {}, last_completion_time {}",
+        elapsed_secs,
+        last_completion_secs_ago,
+    );
+    log::debug!(
+        "Bef: sum_weights {}, weighted_sum {:?}",
+        sum_weights,
+        weighted_sum
+    );
+    if last_completion_secs_ago > 2.0 {
+        let fake_completion_times_count = completion_times.0.len() + active_threads_count;
+        for i in 1..fake_completion_times_count {
+            let weight = (i.pow(2)) as u32;
+            sum_weights += weight;
+            weighted_sum += time::Duration::from_secs_f32(last_completion_secs_ago) * weight;
+        }
+    }
+    log::debug!(
+        "Aft: sum_weights {}, weighted_sum {:?}",
+        sum_weights,
+        weighted_sum
+    );
+
+    let weighted_avg_time_per_thread = weighted_sum / sum_weights;
     tracing::debug!(
         "avg_time_per_thread {:?}, active_threads {}, hosts_left {}",
-        avg_time_per_thread,
+        weighted_avg_time_per_thread,
         active_threads_count,
         hosts_left
     );
 
     let eta_str: String = if hosts_left_pct <= 99.0 && elapsed_secs > 4.0 {
-        let eta_wma =
-            (avg_time_per_thread.as_secs_f32() * hosts_left as f32) / active_threads_count as f32;
-        let eta_div = hosts_left as f32 / ((hosts_total - hosts_left) as f32 / elapsed_secs);
-        let eta = (eta_wma + eta_div) / 2.0;
+        let eta_wma = (weighted_avg_time_per_thread.as_secs_f32() * hosts_left as f32)
+            / active_threads_count as f32;
+        let hosts_done = hosts_total - hosts_left;
+        let eta_avg_rate = hosts_left as f32 / (hosts_done as f32 / elapsed_secs);
+        let eta = (eta_wma + eta_avg_rate) / 2.0;
+        // let eta = eta_wma;
         let eta_m = eta as u32 / 60;
         let eta_s = eta % 60.0;
 
-        // format!("{:02}m{:02.0}s({:2.1}|{:2.1})", eta_m, eta_s, eta_wma, eta_div)
-        format!("{:02}m{:02.0}s", eta_m, eta_s) // ;
+        // Signify slope direction with one or more arrows, depending on
+        // direction and magnitude (→, ⇗, ↑, ↑↑, ⇘, ↓, ↓↓).
+        let slope_ratio = eta_wma / eta_avg_rate;
+        let slope_direction = if slope_ratio > 1.5 {
+            "↑↑"
+        } else if slope_ratio > 1.25 {
+            " ↑"
+        } else if slope_ratio > 1.0 {
+            " ⇗"
+        } else if slope_ratio < 0.666 {
+            "↓↓"
+        } else if slope_ratio < 0.75 {
+            "↓ "
+        } else if slope_ratio < 0.8 {
+            "⇘ "
+        } else {
+            "→ "
+        };
+/*
+        format!(
+            "{:02}m{:02.0}s({:2.1}|{:2.1}){}{}s",
+            eta_m, eta_s, eta_wma, eta_avg_rate, slope_direction, elapsed_secs
+        )
+*/
+        format!(
+            "{:02}m{:02.0}s({:2.1}|{:2.1})",
+            eta_m, eta_s, eta_wma, eta_avg_rate
+        )
     } else {
         "??m??s".to_string() // ;
     };
@@ -360,12 +417,14 @@ fn spawn_print_thread(
     let print_thread = thread::spawn(move || {
         let start_time = std::time::SystemTime::now();
         let mut hosts_left = hosts_total;
-        let mut completion_times = Vec::<std::time::Duration>::new();
+        let mut completion_times = (Vec::<std::time::Duration>::new(), time::Instant::now());
+        let mut active_threads_cache: usize = 0;
 
         loop {
-            match rx.recv() {
+            match rx.recv_timeout(time::Duration::from_millis(1000)) {
                 Ok(msg) => {
                     let (host, mut out, exit_status, thread_elapsed, active_threads) = msg;
+                    active_threads_cache = active_threads;
 
                     // Exit if the print thread receives the exit code from the
                     // main thread. This is a hack, but exiting is the only
@@ -412,7 +471,8 @@ fn spawn_print_thread(
                         out.take();
                     }
 
-                    completion_times.push(thread_elapsed);
+                    completion_times.0.push(thread_elapsed);
+                    completion_times.1 = time::Instant::now();
 
                     // Calculate progress and ETA by calling:
                     let (hosts_left_updated, hosts_left_pct, eta_str) = calculate_progress(
@@ -420,7 +480,8 @@ fn spawn_print_thread(
                         hosts_left,
                         start_time,
                         &completion_times,
-                        active_threads,
+                        active_threads_cache,
+                        1, // One new host processed
                     );
                     hosts_left = hosts_left_updated;
 
@@ -434,10 +495,36 @@ fn spawn_print_thread(
                         eta_str,
                     );
                 }
+                Err(e) => match e {
+                    mpsc::RecvTimeoutError::Timeout => {
+                        // Handle periodic progress updates here
+                        // Calculate progress and print it even though no new message was received
+                        let (hosts_left_updated, hosts_left_pct, eta_str) = calculate_progress(
+                            hosts_total,
+                            hosts_left,
+                            start_time,
+                            &completion_times,
+                            // You might need to adjust the way active_threads is determined
+                            // since it won't be updated directly by message processing in this case
+                            active_threads_cache,
+                            0, // No new hosts processed
+                        );
+                        hosts_left = hosts_left_updated;
 
-                Err(e) => {
-                    log::error!("Error receiving from channel: {}", e);
-                }
+                        print_output(
+                            "",            // Placeholder for host, since no new message was received
+                            String::new(), // Placeholder for out
+                            0,             // Placeholder for exit_status
+                            host_max_width,
+                            hosts_left_pct,
+                            eta_str,
+                        );
+                    }
+                    mpsc::RecvTimeoutError::Disconnected => {
+                        log::error!("Channel disconnected");
+                        break;
+                    }
+                },
             }
         }
     });
