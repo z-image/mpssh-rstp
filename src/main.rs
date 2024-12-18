@@ -49,6 +49,11 @@ const AUTHOR: &str = "Teodor Milkov <tm@del.bg>";
 
 const SIGNAL_THREAD_EXIT: i32 = 999;
 
+struct CompletionTimes {
+    durations: Vec<time::Duration>,
+    last_update: time::Instant,
+}
+
 fn retry<T, F, E>(mut operation: F, op_name: &str, op_arg: &str) -> Result<T, E>
 where
     F: FnMut() -> Result<T, E>,
@@ -248,7 +253,7 @@ fn calculate_progress(
     hosts_total: usize,
     mut hosts_left: usize,
     start_time: std::time::SystemTime,
-    completion_times: &(Vec<std::time::Duration>, time::Instant),
+    completion_times: &CompletionTimes,
     active_threads_count: usize,
     hosts_processed: usize,
 ) -> (usize, f32, String) {
@@ -260,7 +265,7 @@ fn calculate_progress(
     let mut sum_weights = 1;
 
     let mut weighted_sum = std::time::Duration::ZERO;
-    for (i, &time) in completion_times.0.iter().enumerate() {
+    for (i, &time) in completion_times.durations.iter().enumerate() {
         let weight = (i.pow(2)) as u32;
         sum_weights += weight;
         weighted_sum += time * weight;
@@ -269,7 +274,7 @@ fn calculate_progress(
     // If the last completion time was more than 2 seconds ago, it's possible
     // that there are still some slow hosts left blocking (long tail
     // distribution). In this case, we add an additional (fake) weight/time.
-    let last_completion_secs_ago = completion_times.1.elapsed().as_secs_f32();
+    let last_completion_secs_ago = completion_times.last_update.elapsed().as_secs_f32();
     log::debug!(
         "elapsed_secs {}, last_completion_time {}",
         elapsed_secs,
@@ -281,7 +286,7 @@ fn calculate_progress(
         weighted_sum
     );
     if last_completion_secs_ago > 2.0 {
-        let fake_completion_times_count = completion_times.0.len() + active_threads_count;
+        let fake_completion_times_count = completion_times.durations.len() + active_threads_count;
         for i in 1..fake_completion_times_count {
             let weight = (i.pow(2)) as u32;
             sum_weights += weight;
@@ -330,12 +335,12 @@ fn calculate_progress(
         } else {
             "→ "
         };
-/*
-        format!(
-            "{:02}m{:02.0}s({:2.1}|{:2.1}){}{}s",
-            eta_m, eta_s, eta_wma, eta_avg_rate, slope_direction, elapsed_secs
-        )
-*/
+        /*
+                format!(
+                    "{:02}m{:02.0}s({:2.1}|{:2.1}){}{}s",
+                    eta_m, eta_s, eta_wma, eta_avg_rate, slope_direction, elapsed_secs
+                )
+        */
         format!(
             "{:02}m{:02.0}s({:2.1}|{:2.1})",
             eta_m, eta_s, eta_wma, eta_avg_rate
@@ -417,7 +422,10 @@ fn spawn_print_thread(
     let print_thread = thread::spawn(move || {
         let start_time = std::time::SystemTime::now();
         let mut hosts_left = hosts_total;
-        let mut completion_times = (Vec::<std::time::Duration>::new(), time::Instant::now());
+        let mut completion_times = CompletionTimes {
+            durations: Vec::new(),
+            last_update: time::Instant::now(),
+        };
         let mut active_threads_cache: usize = 0;
 
         loop {
@@ -471,8 +479,8 @@ fn spawn_print_thread(
                         out.take();
                     }
 
-                    completion_times.0.push(thread_elapsed);
-                    completion_times.1 = time::Instant::now();
+                    completion_times.durations.push(thread_elapsed);
+                    completion_times.last_update = time::Instant::now();
 
                     // Calculate progress and ETA by calling:
                     let (hosts_left_updated, hosts_left_pct, eta_str) = calculate_progress(
@@ -798,4 +806,72 @@ fn main() {
     .unwrap();
 
     print_thread.join().unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_calculate_progress_long_tail() {
+        let hosts_total = 100;
+        let hosts_left = 50;
+        let start_time = std::time::SystemTime::now();
+
+        // Create old completion time to trigger long tail handling
+        let completion_times = CompletionTimes {
+            durations: vec![time::Duration::from_secs(1)],
+            last_update: time::Instant::now() - time::Duration::from_secs(3),
+        };
+
+        let (left, pct, eta) = calculate_progress(
+            hosts_total,
+            hosts_left,
+            start_time,
+            &completion_times,
+            10,
+            5,
+        );
+
+        assert_eq!(left, 45);
+        assert!((pct - 45.0).abs() < 0.01);
+        assert!(eta.contains("m") && eta.contains("s"));
+    }
+
+    #[test]
+    fn test_calculate_progress_early_stage() {
+        let start_time = std::time::SystemTime::now();
+        let completion_times = CompletionTimes {
+            durations: vec![
+                time::Duration::from_secs(1),
+                time::Duration::from_secs(1),
+                time::Duration::from_secs(1),
+            ],
+            last_update: time::Instant::now(),
+        };
+        let (left, pct, eta) = calculate_progress(100, 99, start_time, &completion_times, 10, 1);
+
+        assert_eq!(left, 98);
+        assert_eq!(pct, 98.0);
+        assert_eq!(eta, "??m??s"); // Too early for ETA
+    }
+
+    #[test]
+    fn test_calculate_progress_almost_done() {
+        let start_time = std::time::SystemTime::now() - std::time::Duration::from_secs(10);
+        let completion_times = CompletionTimes {
+            durations: vec![
+                time::Duration::from_secs(1),
+                time::Duration::from_secs(1),
+                time::Duration::from_secs(1),
+            ],
+            last_update: time::Instant::now(),
+        };
+
+        let (left, pct, eta) = calculate_progress(100, 2, start_time, &completion_times, 2, 1);
+
+        assert_eq!(left, 1);
+        assert_eq!(pct, 1.0);
+        assert!(eta.contains("m") && eta.contains("s"));
+    }
 }
