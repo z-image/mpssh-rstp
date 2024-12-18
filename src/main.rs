@@ -249,6 +249,48 @@ fn execute(remote_host: &str, command: &str, remote_user: &str) -> (Option<Strin
     (Some(out), exit_status)
 }
 
+fn calculate_wma_eta(
+    completion_times: &CompletionTimes,
+    active_threads_count: usize,
+    hosts_left: usize,
+) -> f32 {
+    let mut sum_weights = 0;
+    let mut weighted_sum = std::time::Duration::ZERO;
+
+    for (i, &time) in completion_times.durations.iter().enumerate() {
+        // i starts from 0, but weight 0 doesn't make sense
+        let weight = (i + 1).pow(2) as u32;
+        sum_weights += weight;
+        weighted_sum += time * weight;
+    }
+
+    // This is to account for the case where the last completion was a long time
+    // ago and the completion times are not representative of the current rate
+    // (long tail distribution). Add a fake completion time for each active
+    // thread.
+    // FIXME: This does not sound right. Shouldn't we add just one fake
+    // completion time, instead of one per active thread?
+    let last_completion_secs_ago = completion_times.last_update.elapsed().as_secs_f32();
+    if last_completion_secs_ago > 2.0 {
+        let fake_completion_times_count = completion_times.durations.len() + active_threads_count;
+        for i in completion_times.durations.len()..fake_completion_times_count {
+            let weight = (i + 1).pow(2) as u32;
+            sum_weights += weight;
+            weighted_sum += time::Duration::from_secs_f32(last_completion_secs_ago) * weight;
+        }
+    }
+
+    let weighted_avg_time_per_thread = weighted_sum / sum_weights;
+    tracing::debug!(
+        "avg_time_per_thread {:?}, active_threads {}, hosts_left {}",
+        weighted_avg_time_per_thread,
+        active_threads_count,
+        hosts_left
+    );
+
+    (weighted_avg_time_per_thread.as_secs_f32() * hosts_left as f32) / active_threads_count as f32
+}
+
 fn calculate_progress(
     hosts_total: usize,
     hosts_left: usize,
@@ -258,58 +300,11 @@ fn calculate_progress(
     hosts_processed: usize,
 ) -> (usize, f32, String) {
     let updated_hosts_left = hosts_left - hosts_processed;
-
     let hosts_left_pct = updated_hosts_left as f32 / hosts_total as f32 * 100.0;
     let elapsed_secs = start_time.elapsed().unwrap().as_secs() as f32;
 
-    let mut sum_weights = 1;
-
-    let mut weighted_sum = std::time::Duration::ZERO;
-    for (i, &time) in completion_times.durations.iter().enumerate() {
-        let weight = (i.pow(2)) as u32;
-        sum_weights += weight;
-        weighted_sum += time * weight;
-    }
-
-    // If the last completion time was more than 2 seconds ago, it's possible
-    // that there are still some slow hosts left blocking (long tail
-    // distribution). In this case, we add an additional (fake) weight/time.
-    let last_completion_secs_ago = completion_times.last_update.elapsed().as_secs_f32();
-    log::debug!(
-        "elapsed_secs {}, last_completion_time {}",
-        elapsed_secs,
-        last_completion_secs_ago,
-    );
-    log::debug!(
-        "Bef: sum_weights {}, weighted_sum {:?}",
-        sum_weights,
-        weighted_sum
-    );
-    if last_completion_secs_ago > 2.0 {
-        let fake_completion_times_count = completion_times.durations.len() + active_threads_count;
-        for i in 1..fake_completion_times_count {
-            let weight = (i.pow(2)) as u32;
-            sum_weights += weight;
-            weighted_sum += time::Duration::from_secs_f32(last_completion_secs_ago) * weight;
-        }
-    }
-    log::debug!(
-        "Aft: sum_weights {}, weighted_sum {:?}",
-        sum_weights,
-        weighted_sum
-    );
-
-    let weighted_avg_time_per_thread = weighted_sum / sum_weights;
-    tracing::debug!(
-        "avg_time_per_thread {:?}, active_threads {}, hosts_left {}",
-        weighted_avg_time_per_thread,
-        active_threads_count,
-        updated_hosts_left
-    );
-
     let eta_str: String = if hosts_left_pct <= 99.0 && elapsed_secs > 4.0 {
-        let eta_wma = (weighted_avg_time_per_thread.as_secs_f32() * updated_hosts_left as f32)
-            / active_threads_count as f32;
+        let eta_wma = calculate_wma_eta(completion_times, active_threads_count, updated_hosts_left);
         let hosts_done = hosts_total - updated_hosts_left;
         let eta_avg_rate = updated_hosts_left as f32 / (hosts_done as f32 / elapsed_secs);
         let eta = (eta_wma + eta_avg_rate) / 2.0;
@@ -811,6 +806,61 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_calculate_wma_eta() {
+        let completion_times = CompletionTimes {
+            durations: vec![
+                time::Duration::from_secs(1),
+                time::Duration::from_secs(2),
+                time::Duration::from_secs(3),
+            ],
+            last_update: time::Instant::now(),
+        };
+
+        let eta = calculate_wma_eta(&completion_times, 10, 50);
+
+        // With 3 samples of 1s, 2s, 3s
+        // Weights: 1,4,9
+        // sum_weights = 1+4+9 = 14
+        // weighted_sum = 1*1 + 2*4 + 3*9 = 1 + 8 + 27 = 36
+        // Expected weighted avg: 36/14 = 2.57s
+        // Expected ETA = 2.57s * 50 hosts / 10 threads = 12.85s
+        assert!((eta - 12.85).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_calculate_wma_eta_long_tail() {
+        let completion_times = CompletionTimes {
+            durations: vec![time::Duration::from_secs(1)],
+            last_update: time::Instant::now() - time::Duration::from_secs(5),
+        };
+
+        let eta = calculate_wma_eta(&completion_times, 2, 10);
+
+        // Should account for 5s delay in last completion
+        // With 1 real sample of 1s and 2 fake samples of 5s
+        // Weights: 1,4,9
+        // sum_weights = 1+4+9 = 14
+        // weighted_sum = 1*1 + 5*4 + 5*9 = 1 + 20 + 45 = 66
+        // Expected weighted avg: 66/14 = 4.71s
+        // Expected ETA = 4.71s * 10 hosts / 2 threads = 23.55s
+        assert!((eta - 23.55).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_calculate_wma_eta_single_sample() {
+        let completion_times = CompletionTimes {
+            durations: vec![time::Duration::from_secs(2)],
+            last_update: time::Instant::now(),
+        };
+
+        let eta = calculate_wma_eta(&completion_times, 5, 20);
+
+        // With single 2s sample
+        // Expected ETA = 2s * 20 hosts / 5 threads = 8s
+        assert!((eta - 8.0).abs() < 0.1);
+    }
 
     #[test]
     fn test_calculate_progress_long_tail() {
