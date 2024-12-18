@@ -251,15 +251,15 @@ fn execute(remote_host: &str, command: &str, remote_user: &str) -> (Option<Strin
 
 fn calculate_progress(
     hosts_total: usize,
-    mut hosts_left: usize,
+    hosts_left: usize,
     start_time: std::time::SystemTime,
     completion_times: &CompletionTimes,
     active_threads_count: usize,
     hosts_processed: usize,
 ) -> (usize, f32, String) {
-    hosts_left -= hosts_processed;
+    let updated_hosts_left = hosts_left - hosts_processed;
 
-    let hosts_left_pct = hosts_left as f32 / hosts_total as f32 * 100.0;
+    let hosts_left_pct = updated_hosts_left as f32 / hosts_total as f32 * 100.0;
     let elapsed_secs = start_time.elapsed().unwrap().as_secs() as f32;
 
     let mut sum_weights = 1;
@@ -304,14 +304,14 @@ fn calculate_progress(
         "avg_time_per_thread {:?}, active_threads {}, hosts_left {}",
         weighted_avg_time_per_thread,
         active_threads_count,
-        hosts_left
+        updated_hosts_left
     );
 
     let eta_str: String = if hosts_left_pct <= 99.0 && elapsed_secs > 4.0 {
-        let eta_wma = (weighted_avg_time_per_thread.as_secs_f32() * hosts_left as f32)
+        let eta_wma = (weighted_avg_time_per_thread.as_secs_f32() * updated_hosts_left as f32)
             / active_threads_count as f32;
-        let hosts_done = hosts_total - hosts_left;
-        let eta_avg_rate = hosts_left as f32 / (hosts_done as f32 / elapsed_secs);
+        let hosts_done = hosts_total - updated_hosts_left;
+        let eta_avg_rate = updated_hosts_left as f32 / (hosts_done as f32 / elapsed_secs);
         let eta = (eta_wma + eta_avg_rate) / 2.0;
         // let eta = eta_wma;
         let eta_m = eta as u32 / 60;
@@ -349,7 +349,7 @@ fn calculate_progress(
         "??m??s".to_string() // ;
     };
 
-    (hosts_left, hosts_left_pct, eta_str)
+    (updated_hosts_left, hosts_left_pct, eta_str)
 }
 
 fn print_output(
