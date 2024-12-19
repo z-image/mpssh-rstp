@@ -555,7 +555,7 @@ fn get_hosts_list(filename: &str) -> Vec<String> {
     hosts_list
 }
 
-fn process_args() -> clap::ArgMatches<'static> {
+fn process_args(args: Option<Vec<&str>>) -> clap::ArgMatches<'static> {
     let matches = App::new("Mass parallel SSH in Rust")
         .version(VERSION)
         .author(AUTHOR)
@@ -608,10 +608,17 @@ fn process_args() -> clap::ArgMatches<'static> {
                 .help("Write output to files, one per host"),
         )
         .arg(Arg::with_name("command").takes_value(true).required(true))
-        .arg(Arg::with_name("debug").takes_value(false).long("debug"))
-        .get_matches();
+        .arg(Arg::with_name("debug").takes_value(false).long("debug"));
 
-    matches
+    // If args are provided, call get_matches_from_safe() to avoid panics.
+    if let Some(args) = args {
+        // On error, print the error message and return an empty ArgMatches.
+        matches
+            .get_matches_from_safe(args)
+            .expect("Error parsing arguments.")
+    } else {
+        matches.get_matches()
+    }
 }
 
 fn get_rlim_nofiles() -> usize {
@@ -641,10 +648,49 @@ fn ensure_dir_is_clean_and_writable() {
     std::fs::remove_file(test_filename).unwrap();
 }
 
-fn main() {
-    let matches = process_args();
+struct Config {
+    hosts_list_file: String,
+    parallel_sessions: usize,
+    delay: u64,
+    remote_command: String,
+    remote_user: String,
+    write_to_file: bool,
+    suppress_output: bool,
+    debug: bool,
+}
 
-    let level = if matches.is_present("debug") {
+impl Config {
+    fn from_args(matches: clap::ArgMatches) -> Self {
+        let mut remote_user = matches.value_of("user").unwrap_or("").to_owned();
+
+        if remote_user.is_empty() {
+            remote_user = users::get_current_username()
+                .expect("The current user does not exist!")
+                .into_string()
+                .unwrap();
+        }
+
+        Self {
+            hosts_list_file: matches.value_of("file").unwrap().to_owned(),
+            parallel_sessions: matches
+                .value_of("parallel")
+                .unwrap()
+                .parse::<usize>()
+                .unwrap(),
+            delay: matches.value_of("delay").unwrap().parse::<u64>().unwrap(),
+            remote_command: matches.value_of("command").unwrap().to_owned(),
+            remote_user,
+            write_to_file: matches.is_present("write_to_file"),
+            suppress_output: matches.is_present("suppress_output"),
+            debug: matches.is_present("debug"),
+        }
+    }
+}
+
+fn main() {
+    let config = Config::from_args(process_args(None));
+
+    let level = if config.debug {
         String::from("debug")
     } else {
         std::env::var("RUST_LOG").unwrap_or_else(|_| String::from("info"))
@@ -666,15 +712,15 @@ fn main() {
         .with(filter)
         .init();
 
-    let hosts_list_file = matches.value_of("file").unwrap();
-    let parallel_sessions = matches
-        .value_of("parallel")
-        .unwrap()
-        .parse::<usize>()
-        .unwrap();
-    let delay = matches.value_of("delay").unwrap().parse::<u64>().unwrap();
-    let remote_command = matches.value_of("command").unwrap().to_owned();
-    let mut remote_user = matches.value_of("user").unwrap().to_owned();
+    run(config);
+}
+
+fn run(config: Config) {
+    let hosts_list_file = config.hosts_list_file;
+    let parallel_sessions = config.parallel_sessions;
+    let delay = config.delay;
+    let remote_command = config.remote_command;
+    let mut remote_user = config.remote_user;
 
     if remote_user.is_empty() {
         remote_user = match users::get_current_username() {
@@ -683,12 +729,11 @@ fn main() {
         };
     }
 
-    let write_to_file = matches.is_present("write_to_file");
-    if write_to_file {
+    if config.write_to_file {
         ensure_dir_is_clean_and_writable();
     }
 
-    let hosts_list = get_hosts_list(hosts_list_file);
+    let hosts_list = get_hosts_list(&hosts_list_file);
     let hosts_total = hosts_list.len();
 
     // Terminate early if there are no hosts.
@@ -713,7 +758,7 @@ fn main() {
     // Create a channel for communication with the print thread.
     let (tx, rx) = mpsc::channel::<(String, Option<String>, i32, time::Duration, usize)>();
 
-    let suppress_output = matches.is_present("suppress_output");
+    let suppress_output = config.suppress_output;
 
     let host_max_width: usize = hosts_list
         .iter()
@@ -724,7 +769,7 @@ fn main() {
     // Create the print thread.
     let print_thread = spawn_print_thread(
         rx,
-        write_to_file,
+        config.write_to_file,
         suppress_output,
         hosts_total,
         host_max_width,
@@ -807,6 +852,94 @@ fn main() {
 mod tests {
     use super::*;
 
+    // Test config_from_args().
+
+    #[test]
+    fn test_config_from_args_basic() {
+        let args = vec![
+            "test",
+            "--debug",
+            "-s",
+            "-w",
+            "-u",
+            "testor",
+            "-f",
+            "hosts.txt",
+            "-p",
+            "10",
+            "-d",
+            "20",
+            "ls",
+        ];
+
+        let matches = process_args(Some(args));
+
+        let config = Config::from_args(matches);
+
+        assert!(config.debug, "debug");
+        assert!(config.suppress_output, "suppress_output");
+        assert!(config.write_to_file, "write_to_file");
+        assert_eq!(config.remote_user, "testor");
+        assert_eq!(config.hosts_list_file, "hosts.txt");
+        assert_eq!(config.parallel_sessions, 10);
+        assert_eq!(config.delay, 20);
+        assert_eq!(config.remote_command, "ls");
+    }
+
+    #[test]
+    fn test_config_from_args_default_values() {
+        let matches = process_args(Some(vec!["test", "-f", "hosts.txt", "ls"]));
+
+        let config = Config::from_args(matches);
+
+        let current_user = users::get_current_username()
+            .unwrap()
+            .into_string()
+            .unwrap();
+
+        assert!(!config.write_to_file, "write_to_file");
+        assert!(!config.suppress_output, "suppress_output");
+        assert!(!config.debug, "debug");
+        assert_eq!(config.remote_user, current_user);
+        assert_eq!(config.parallel_sessions, 100);
+        assert_eq!(config.delay, 10);
+    }
+
+    #[test]
+    fn test_config_from_args_complex_command() {
+        let args = vec![
+            "test",
+            "-f",
+            "hosts.txt",
+            "echo 'complex command' | grep command",
+        ];
+
+        let matches = process_args(Some(args));
+
+        let config = Config::from_args(matches);
+
+        assert_eq!(
+            config.remote_command,
+            "echo 'complex command' | grep command"
+        );
+    }
+
+    #[test]
+    fn test_config_from_args_missing_required_args() {
+        let result = std::panic::catch_unwind(|| {
+            process_args(Some(vec!["test"]));
+        });
+
+        assert!(result.is_err(), "Expected panic on missing required args");
+
+        if let Err(e) = result {
+            let msg = e.downcast_ref::<String>().unwrap();
+            assert!(msg.contains("required arguments were not provided"));
+        }
+    }
+
+    // Test the weighted moving average (WMA) calculation for ETA.
+
     #[test]
     fn test_calculate_wma_eta() {
         let completion_times = CompletionTimes {
@@ -861,6 +994,8 @@ mod tests {
         // Expected ETA = 2s * 20 hosts / 5 threads = 8s
         assert!((eta - 8.0).abs() < 0.1);
     }
+
+    // Test the progress calculation.
 
     #[test]
     fn test_calculate_progress_long_tail() {
