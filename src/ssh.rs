@@ -1,4 +1,5 @@
 use ssh2::Session;
+use std::fmt;
 use std::io::Read;
 use std::net::TcpStream;
 use std::path::Path;
@@ -361,7 +362,7 @@ impl RemoteExecutor for SSHExecutor {
     }
 }
 
-async fn run_with_russh(
+async fn execute_russh(
     remote_host: &str,
     command: &str,
     remote_user: &str,
@@ -462,13 +463,42 @@ fn check_known_host(session: &ssh2::Session, host: &str) -> Result<(), std::io::
     }
 }
 
-pub fn execute(remote_host: &str, command: &str, remote_user: &str) -> (Option<String>, i32) {
-    if true {
-        // Use a tokio runtime just for this call
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        return rt.block_on(run_with_russh(remote_host, command, remote_user));
-    }
+#[derive(Debug, Clone)]
+pub enum SshBackend {
+    Russh,
+    LibSsh2,
+}
 
+impl fmt::Display for SshBackend {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            SshBackend::Russh => write!(f, "russh"),
+            SshBackend::LibSsh2 => write!(f, "libssh2"),
+        }
+    }
+}
+
+pub fn execute(
+    remote_host: &str,
+    command: &str,
+    remote_user: &str,
+    backend: &SshBackend,
+) -> (Option<String>, i32) {
+    match backend {
+        SshBackend::Russh => {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(execute_russh(remote_host, command, remote_user))
+        }
+
+        SshBackend::LibSsh2 => execute_libssh2(remote_host, command, remote_user),
+    }
+}
+
+pub fn execute_libssh2(
+    remote_host: &str,
+    command: &str,
+    remote_user: &str,
+) -> (Option<String>, i32) {
     let remote_port = "22";
     let remote_addr = remote_host.to_owned() + ":" + remote_port;
 

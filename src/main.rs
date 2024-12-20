@@ -411,6 +411,15 @@ fn process_args(args: Option<Vec<&str>>) -> clap::ArgMatches<'static> {
                 .help("Write output to files, one per host"),
         )
         .arg(Arg::with_name("command").takes_value(true).required(true))
+        .arg(
+            Arg::with_name("ssh_backend")
+                .short("b")
+                .long("ssh-backend")
+                .takes_value(true)
+                .possible_values(&["russh", "libssh2"])
+                .default_value("russh")
+                .help("SSH backend to use (russh, libssh2)"),
+        )
         .arg(Arg::with_name("debug").takes_value(false).long("debug"));
 
     // If args are provided, call get_matches_from_safe() to avoid panics.
@@ -457,6 +466,7 @@ struct Config {
     delay: u64,
     remote_command: String,
     remote_user: String,
+    ssh_backend: ssh::SshBackend,
     write_to_file: bool,
     suppress_output: bool,
     debug: bool,
@@ -473,6 +483,16 @@ impl Config {
                 .unwrap();
         }
 
+        let ssh_backend_raw = matches.value_of("ssh_backend").unwrap().to_owned();
+        let ssh_backend = match ssh_backend_raw.as_str() {
+            "russh" => ssh::SshBackend::Russh,
+            "libssh2" => ssh::SshBackend::LibSsh2,
+            _ => {
+                log::error!("Unknown SSH backend: {}", ssh_backend_raw);
+                std::process::exit(1);
+            }
+        };
+
         Self {
             hosts_list_file: matches.value_of("file").unwrap().to_owned(),
             parallel_sessions: matches
@@ -483,6 +503,7 @@ impl Config {
             delay: matches.value_of("delay").unwrap().parse::<u64>().unwrap(),
             remote_command: matches.value_of("command").unwrap().to_owned(),
             remote_user,
+            ssh_backend,
             write_to_file: matches.is_present("write_to_file"),
             suppress_output: matches.is_present("suppress_output"),
             debug: matches.is_present("debug"),
@@ -581,6 +602,7 @@ fn run(config: Config) {
     let pool = ThreadPool::new(n_workers);
 
     eprintln!("Mass parallel SSH in Rust (v{}), (c) {}", VERSION, AUTHOR);
+    eprintln!(" * using {} backend", config.ssh_backend);
     eprintln!(" * {} hosts from the list", hosts_list.len());
     eprintln!(" * {} threads", n_workers);
     eprintln!(" * {} ms delay", delay);
@@ -596,6 +618,7 @@ fn run(config: Config) {
         let command_clone = remote_command.clone();
         let active_threads_clone = active_threads.clone();
         let user_clone = remote_user.clone();
+        let ssh_backend_clone = config.ssh_backend.clone();
         let tx_clone = tx.clone();
 
         tracing::debug!("active_count {}", pool.active_count());
@@ -607,7 +630,7 @@ fn run(config: Config) {
             active_threads_clone.fetch_add(1, Ordering::SeqCst);
 
             let thread_start = std::time::Instant::now();
-            let (out, exit_status) = ssh::execute(&host, &command_clone, &user_clone); // SSH
+            let (out, exit_status) = ssh::execute(&host, &command_clone, &user_clone, &ssh_backend_clone);
             let thread_elapsed = thread_start.elapsed();
 
             // Send output to the print thread.
