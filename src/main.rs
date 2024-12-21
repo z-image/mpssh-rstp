@@ -29,16 +29,16 @@ use prctl::set_name;
 use std::mem::MaybeUninit;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    mpsc, Arc,
+    Arc,
 };
-use std::thread;
 use std::time;
-use threadpool::ThreadPool;
 
 use ansi_term::Colour;
 use atty::Stream;
 use std::fs::File;
 use std::io::BufReader;
+
+use tokio::sync::{mpsc, Semaphore};
 
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
@@ -211,13 +211,13 @@ fn print_output(
 }
 
 fn spawn_print_thread(
-    rx: mpsc::Receiver<(String, Option<String>, i32, time::Duration, usize)>,
+    mut rx: mpsc::Receiver<(String, Option<String>, i32, time::Duration, usize)>,
     write_to_file: bool,
     suppress_output: bool,
     hosts_total: usize,
     host_max_width: usize,
-) -> thread::JoinHandle<()> {
-    let print_thread = thread::spawn(move || {
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
         let start_time = std::time::SystemTime::now();
         let mut hosts_left = hosts_total;
         let mut completion_times = CompletionTimes {
@@ -226,116 +226,118 @@ fn spawn_print_thread(
         };
         let mut active_threads_cache: usize = 0;
 
+        let mut interval = tokio::time::interval(time::Duration::from_secs(1));
+
         loop {
-            match rx.recv_timeout(time::Duration::from_millis(1000)) {
-                Ok(msg) => {
-                    let (host, mut out, exit_status, thread_elapsed, active_threads) = msg;
-                    active_threads_cache = active_threads;
+            tokio::select! {
+                msg = rx.recv() => {
+                    match msg {
+                        Some((host, mut out, exit_status, thread_elapsed, active_threads)) => {
+                            active_threads_cache = active_threads;
 
-                    // Exit if the print thread receives the exit code from the
-                    // main thread. This is a hack, but exiting is the only
-                    // signal we currently need. May create a dedicated messaing
-                    // argument or channel if needed in the future.
-                    if exit_status == SIGNAL_THREAD_EXIT {
-                        break;
-                    }
+                        // Exit if the print thread receives the exit code from the
+                        // main thread. This is a hack, but exiting is the only
+                        // signal we currently need. May create a dedicated messaing
+                        // argument or channel if needed in the future.
+                        if exit_status == SIGNAL_THREAD_EXIT {
+                            break;
+                        }
 
-                    // Write to file if requested and there is output.
-                    if write_to_file && out.is_some() {
-                        let filename = format!("mpssh-{}.out", host);
+                        // Write to file if requested and there is output.
+                        if write_to_file && out.is_some() {
+                            let filename = format!("mpssh-{}.out", host);
 
-                        // Currently all of hosts' output is buffered in memory,
-                        // so no need to append later.
+                            // Currently all of hosts' output is buffered in memory,
+                            // so no need to append later.
 
-                        // Bail out if the file already exists. Checking existence is racey,
-                        // so we just try to open it and fail if it exists.
-                        let mut file = match File::create(&filename) {
-                            Ok(file) => file,
-                            Err(e) => {
-                                log::error!("Failed to create file {}: {}", filename, e);
-                                continue;
-                            }
-                        };
+                            // Bail out if the file already exists. Checking existence is racey,
+                            // so we just try to open it and fail if it exists.
+                            let mut file = match File::create(&filename) {
+                                Ok(file) => file,
+                                Err(e) => {
+                                    log::error!("Failed to create file {}: {}", filename, e);
+                                    continue;
+                                }
+                            };
 
-                        // Write to file and sync to disk. File is closed on drop (end of scope).
-                        {
-                            if let Some(ref output) = out {
-                                if let Err(e) = file.write_all(output.as_bytes()) {
-                                    log::error!("Failed to write to file {}: {}", filename, e);
+                            // Write to file and sync to disk. File is closed on drop (end of scope).
+                            {
+                                if let Some(ref output) = out {
+                                    if let Err(e) = file.write_all(output.as_bytes()) {
+                                        log::error!("Failed to write to file {}: {}", filename, e);
+                                    }
+                                }
+
+                                if let Err(e) = file.sync_all() {
+                                    log::error!("Failed to sync file {}: {}", filename, e);
                                 }
                             }
-
-                            if let Err(e) = file.sync_all() {
-                                log::error!("Failed to sync file {}: {}", filename, e);
-                            }
                         }
-                    }
 
-                    // Clear the output, so it's not printed to stdout, but
-                    // still sent to the print thread, so it can print progress.
-                    if suppress_output {
-                        out.take();
-                    }
+                        // Clear the output, so it's not printed to stdout, but
+                        // still sent to the print thread, so it can print progress.
+                        if suppress_output {
+                            out.take();
+                        }
 
-                    completion_times.durations.push(thread_elapsed);
-                    completion_times.last_update = time::Instant::now();
+                        completion_times.durations.push(thread_elapsed);
+                        completion_times.last_update = time::Instant::now();
 
-                    // Calculate progress and ETA by calling:
-                    let (hosts_left_updated, hosts_left_pct, eta_str) = calculate_progress(
-                        hosts_total,
-                        hosts_left,
-                        start_time,
-                        &completion_times,
-                        active_threads_cache,
-                        1, // One new host processed
-                    );
-                    hosts_left = hosts_left_updated;
-
-                    // print_output() will panic if stdout is closed (e.g. piped to head)
-                    print_output(
-                        &host,
-                        out.as_deref().unwrap_or("").to_string(),
-                        exit_status,
-                        host_max_width,
-                        hosts_left_pct,
-                        eta_str,
-                    );
-                }
-                Err(e) => match e {
-                    mpsc::RecvTimeoutError::Timeout => {
-                        // Handle periodic progress updates here
-                        // Calculate progress and print it even though no new message was received
+                        // Calculate progress and ETA by calling:
                         let (hosts_left_updated, hosts_left_pct, eta_str) = calculate_progress(
                             hosts_total,
                             hosts_left,
                             start_time,
                             &completion_times,
-                            // You might need to adjust the way active_threads is determined
-                            // since it won't be updated directly by message processing in this case
                             active_threads_cache,
-                            0, // No new hosts processed
+                            1, // One new host processed
                         );
                         hosts_left = hosts_left_updated;
 
+                        // print_output() will panic if stdout is closed (e.g. piped to head)
                         print_output(
-                            "",            // Placeholder for host, since no new message was received
-                            String::new(), // Placeholder for out
-                            0,             // Placeholder for exit_status
+                            &host,
+                            out.as_deref().unwrap_or("").to_string(),
+                            exit_status,
                             host_max_width,
                             hosts_left_pct,
                             eta_str,
                         );
                     }
-                    mpsc::RecvTimeoutError::Disconnected => {
-                        log::error!("Channel disconnected");
+                    None => {
+                        log::error!("Channel closed");
                         break;
                     }
-                },
-            }
-        }
-    });
+                } // match
+            } // tokio::select
 
-    print_thread
+            _ = interval.tick() => {
+                            // Handle periodic progress updates here
+                            // Calculate progress and print it even though no new message was received
+                            let (hosts_left_updated, hosts_left_pct, eta_str) = calculate_progress(
+                                hosts_total,
+                                hosts_left,
+                                start_time,
+                                &completion_times,
+                                // You might need to adjust the way active_threads is determined
+                                // since it won't be updated directly by message processing in this case
+                                active_threads_cache,
+                                0, // No new hosts processed
+                            );
+                            hosts_left = hosts_left_updated;
+
+                            print_output(
+                                "",            // Placeholder for host, since no new message was received
+                                String::new(), // Placeholder for out
+                                0,             // Placeholder for exit_status
+                                host_max_width,
+                                hosts_left_pct,
+                                eta_str,
+                            );
+                        }
+                    } // tokio::select
+        } // loop
+    }) // tokio::spawn
 }
 
 fn get_hosts_list(filename: &str) -> Vec<String> {
@@ -460,6 +462,7 @@ fn ensure_dir_is_clean_and_writable() {
     std::fs::remove_file(test_filename).unwrap();
 }
 
+#[derive(Debug, Clone)]
 struct Config {
     hosts_list_file: String,
     parallel_sessions: usize,
@@ -539,7 +542,8 @@ fn main() {
     run(config);
 }
 
-fn run(config: Config) {
+#[tokio::main]
+async fn run(config: Config) {
     let hosts_list_file = config.hosts_list_file;
     let parallel_sessions = config.parallel_sessions;
     let delay = config.delay;
@@ -552,6 +556,8 @@ fn run(config: Config) {
             None => panic!("The current user does not exist!"),
         };
     }
+
+    let ssh_backend = config.ssh_backend;
 
     if config.write_to_file {
         ensure_dir_is_clean_and_writable();
@@ -580,7 +586,9 @@ fn run(config: Config) {
     }
 
     // Create a channel for communication with the print thread.
-    let (tx, rx) = mpsc::channel::<(String, Option<String>, i32, time::Duration, usize)>();
+    let (tx, rx) = tokio::sync::mpsc::channel::<(String, Option<String>, i32, time::Duration, usize)>(
+        n_workers,
+    );
 
     let suppress_output = config.suppress_output;
 
@@ -599,10 +607,10 @@ fn run(config: Config) {
         host_max_width,
     );
 
-    let pool = ThreadPool::new(n_workers);
+    let semaphore = Arc::new(Semaphore::new(n_workers));
 
     eprintln!("Mass parallel SSH in Rust (v{}), (c) {}", VERSION, AUTHOR);
-    eprintln!(" * using {} backend", config.ssh_backend);
+    eprintln!(" * using {} backend", ssh_backend);
     eprintln!(" * {} hosts from the list", hosts_list.len());
     eprintln!(" * {} threads", n_workers);
     eprintln!(" * {} ms delay", delay);
@@ -614,33 +622,46 @@ fn run(config: Config) {
     // could be sufficient now.
     let active_threads = Arc::new(AtomicUsize::new(0));
 
+    let mut join_set = tokio::task::JoinSet::new();
+
     for host in hosts_list {
+        let semaphore_clone = semaphore.clone();
+
         let command_clone = remote_command.clone();
         let active_threads_clone = active_threads.clone();
         let user_clone = remote_user.clone();
-        let ssh_backend_clone = config.ssh_backend.clone();
+        let ssh_backend_clone = ssh_backend.clone();
         let tx_clone = tx.clone();
 
-        tracing::debug!("active_count {}", pool.active_count());
-        pool.execute(move || {
+        tracing::debug!("semaphore permits: {}", semaphore.available_permits());
+
+        join_set.spawn(async move {
             let mut thread_name = "mps: ".to_owned();
             thread_name.push_str(&host);
             set_name(&thread_name).unwrap();
 
+            let _permit = semaphore_clone.acquire().await.unwrap();
+
             active_threads_clone.fetch_add(1, Ordering::SeqCst);
 
             let thread_start = std::time::Instant::now();
-            let (out, exit_status) = ssh::execute(&host, &command_clone, &user_clone, &ssh_backend_clone);
+
+            let (out, exit_status) =
+                ssh::execute(&host, &command_clone, &user_clone, &ssh_backend_clone).await;
+
             let thread_elapsed = thread_start.elapsed();
 
             // Send output to the print thread.
-            match tx_clone.send((
-                host.clone(),
-                out,
-                exit_status,
-                thread_elapsed,
-                active_threads_clone.load(Ordering::SeqCst),
-            )) {
+            match tx_clone
+                .send((
+                    host.clone(),
+                    out,
+                    exit_status,
+                    thread_elapsed,
+                    active_threads_clone.load(Ordering::SeqCst),
+                ))
+                .await
+            {
                 Ok(_) => {
                     log::debug!("Sent to print thread: {}", host);
                 }
@@ -654,12 +675,16 @@ fn run(config: Config) {
             set_name(&thread_name).unwrap();
 
             active_threads_clone.fetch_sub(1, Ordering::SeqCst);
-        });
 
-        thread::sleep(time::Duration::from_millis(delay));
+            drop(_permit);
+        }); // pool.execute()
+
+        tokio::time::sleep(time::Duration::from_millis(delay)).await;
+    } // for hosts_list
+
+    while let Some(result) = join_set.join_next().await {
+        result.unwrap();
     }
-
-    pool.join();
 
     // Tell the print thread to exit.
     tx.send((
@@ -669,9 +694,12 @@ fn run(config: Config) {
         time::Duration::from_secs(0),
         0,
     ))
+    .await
     .unwrap();
 
-    print_thread.join().unwrap();
+    drop(tx);
+
+    print_thread.await.unwrap();
 }
 
 #[cfg(test)]
@@ -884,5 +912,37 @@ mod tests {
         assert_eq!(left, 1);
         assert_eq!(pct, 1.0);
         assert!(eta.contains("m") && eta.contains("s"));
+    }
+
+    // Test the spawn_print_thread() function.
+
+    #[tokio::test]
+    async fn test_spawn_print_thread_basic_output() {
+        let (tx, rx) = mpsc::channel(1);
+
+        let print_thread = spawn_print_thread(rx, false, false, 100, 10);
+
+        tx.send((
+            "host".to_string(),
+            Some("output".to_string()),
+            0,
+            time::Duration::from_secs(1),
+            1,
+        ))
+        .await
+        .unwrap();
+
+        // Send the exit signal.
+        tx.send((
+            "".to_string(),
+            None,
+            SIGNAL_THREAD_EXIT,
+            time::Duration::from_secs(0),
+            0,
+        ))
+        .await
+        .unwrap();
+
+        print_thread.await.unwrap();
     }
 }

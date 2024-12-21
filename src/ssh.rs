@@ -478,19 +478,24 @@ impl fmt::Display for SshBackend {
     }
 }
 
-pub fn execute(
+pub async fn execute(
     remote_host: &str,
     command: &str,
     remote_user: &str,
     backend: &SshBackend,
 ) -> (Option<String>, i32) {
     match backend {
-        SshBackend::Russh => {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(execute_russh(remote_host, command, remote_user))
-        }
+        SshBackend::Russh => execute_russh(remote_host, command, remote_user).await,
 
-        SshBackend::LibSsh2 => execute_libssh2(remote_host, command, remote_user),
+        SshBackend::LibSsh2 => {
+            // LibSsh2 remains synchronous, use spawn_blocking to handle it in async context
+            let remote_host_clone = remote_host.to_string();
+            let command_clone = command.to_string();
+            let remote_user_clone = remote_user.to_string();
+            tokio::task::spawn_blocking(move || {
+                execute_libssh2(&remote_host_clone, &command_clone, &remote_user_clone)
+            }).await.unwrap()
+        }
     }
 }
 
