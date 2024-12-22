@@ -289,12 +289,12 @@ pub struct ServerConfig {
 
 /* <main> */
 
-pub struct SSHExecutor {
+pub struct RusshExecutor {
     config: ServerConfig,
 }
 
 #[async_trait]
-impl RemoteExecutor for SSHExecutor {
+impl RemoteExecutor for RusshExecutor {
     async fn run_command(&self, command: &str) -> Result<CommandResult> {
         let ssh_config = client::Config::default();
         let config = Arc::new(ssh_config);
@@ -360,34 +360,6 @@ impl RemoteExecutor for SSHExecutor {
             exit_code,
         })
     }
-}
-
-async fn execute_russh(
-    remote_host: &str,
-    command: &str,
-    remote_user: &str,
-) -> (Option<String>, i32) {
-    let config = ServerConfig {
-        host: remote_host.to_string(),
-        port: 22,
-        username: remote_user.to_string(),
-        password: None,
-    };
-    let executor = SSHExecutor {
-        config: config.clone(),
-    };
-
-    let result = match executor.run_command(command).await {
-        Ok(res) => res,
-        Err(e) => {
-            log::error!("russh execution error: {}", e);
-            return (None, 1);
-        }
-    };
-
-    let combined = [&result.stdout[..], &result.stderr[..]].concat();
-    let output_str = String::from_utf8_lossy(&combined).to_string();
-    (Some(output_str), result.exit_code as i32)
 }
 
 // </russh> ///////////////////////////////////////////////////////////////
@@ -484,18 +456,58 @@ pub async fn execute(
     remote_user: &str,
     backend: &SshBackend,
 ) -> (Option<String>, i32) {
-    match backend {
-        SshBackend::Russh => execute_russh(remote_host, command, remote_user).await,
+    let server_config = ServerConfig {
+        host: remote_host.to_string(),
+        port: 22,
+        username: remote_user.to_string(),
+        password: None,
+    };
 
-        SshBackend::LibSsh2 => {
-            // LibSsh2 remains synchronous, use spawn_blocking to handle it in async context
-            let remote_host_clone = remote_host.to_string();
-            let command_clone = command.to_string();
-            let remote_user_clone = remote_user.to_string();
-            tokio::task::spawn_blocking(move || {
-                execute_libssh2(&remote_host_clone, &command_clone, &remote_user_clone)
-            }).await.unwrap()
+    let result = match backend {
+        SshBackend::Russh => {
+            let executor = RusshExecutor {
+                config: server_config.clone(),
+            };
+            executor.run_command(command).await
         }
+        SshBackend::LibSsh2 => {
+            let executor = LibSsh2Executor {
+                config: server_config.clone(),
+            };
+            executor.run_command(command).await
+        }
+    };
+
+    match result {
+        Ok(res) => {
+            let combined = [&res.stdout[..], &res.stderr[..]].concat();
+            let output_str = String::from_utf8_lossy(&combined).to_string();
+            (Some(output_str), res.exit_code as i32)
+        }
+        Err(e) => {
+            log::error!("execution error: {}", e);
+            (None, 1)
+        }
+    }
+}
+
+pub struct LibSsh2Executor {
+    config: ServerConfig,
+}
+
+#[async_trait]
+impl RemoteExecutor for LibSsh2Executor {
+    async fn run_command(&self, command: &str) -> Result<CommandResult> {
+        let remote_host = &self.config.host;
+        let remote_user = &self.config.username;
+
+        let (output, exit_code) = execute_libssh2(remote_host, command, remote_user);
+
+        Ok(CommandResult {
+            stdout: output.unwrap().into_bytes(),
+            stderr: Vec::new(),
+            exit_code: exit_code as u32,
+        })
     }
 }
 
