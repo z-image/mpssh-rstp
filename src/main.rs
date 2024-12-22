@@ -47,110 +47,100 @@ const AUTHOR: &str = "Teodor Milkov <tm@del.bg>";
 
 const SIGNAL_THREAD_EXIT: i32 = 999;
 
+#[derive(Debug)]
 struct CompletionTimes {
     durations: Vec<time::Duration>,
     last_update: time::Instant,
 }
 
-fn calculate_wma_eta(
-    completion_times: &CompletionTimes,
-    active_threads_count: usize,
-    hosts_left: usize,
-) -> f32 {
-    let mut sum_weights = 0;
-    let mut weighted_sum = std::time::Duration::ZERO;
+#[derive(Debug)]
+pub struct ProgressTracker {
+    hosts_total: usize,
+    start_time: time::Instant,
+    completion_times: CompletionTimes,
+    active_threads: usize,
+}
 
-    for (i, &time) in completion_times.durations.iter().enumerate() {
-        // i starts from 0, but weight 0 doesn't make sense
-        let weight = (i + 1).pow(2) as u32;
-        sum_weights += weight;
-        weighted_sum += time * weight;
-    }
-
-    // This is to account for the case where the last completion was a long time
-    // ago and the completion times are not representative of the current rate
-    // (long tail distribution). Add a fake completion time for each active
-    // thread.
-    // FIXME: This does not sound right. Shouldn't we add just one fake
-    // completion time, instead of one per active thread?
-    let last_completion_secs_ago = completion_times.last_update.elapsed().as_secs_f32();
-    if last_completion_secs_ago > 2.0 {
-        let fake_completion_times_count = completion_times.durations.len() + active_threads_count;
-        for i in completion_times.durations.len()..fake_completion_times_count {
-            let weight = (i + 1).pow(2) as u32;
-            sum_weights += weight;
-            weighted_sum += time::Duration::from_secs_f32(last_completion_secs_ago) * weight;
+/// Calculate the progress of the parallel SSH execution.
+impl ProgressTracker {
+    pub fn new(hosts_total: usize) -> Self {
+        Self {
+            hosts_total,
+            start_time: time::Instant::now(),
+            completion_times: CompletionTimes {
+                durations: Vec::new(),
+                last_update: time::Instant::now(),
+            },
+            active_threads: 0,
         }
     }
 
-    let weighted_avg_time_per_thread = weighted_sum / sum_weights;
-    tracing::debug!(
-        "avg_time_per_thread {:?}, active_threads {}, hosts_left {}",
-        weighted_avg_time_per_thread,
-        active_threads_count,
-        hosts_left
-    );
+    pub fn update_completion(&mut self, thread_elapsed: time::Duration) {
+        self.completion_times.durations.push(thread_elapsed);
+        self.completion_times.last_update = time::Instant::now();
+    }
 
-    (weighted_avg_time_per_thread.as_secs_f32() * hosts_left as f32) / active_threads_count as f32
-}
+    pub fn update_active_threads(&mut self, count: usize) {
+        self.active_threads = count;
+    }
 
-fn calculate_progress(
-    hosts_total: usize,
-    hosts_left: usize,
-    start_time: std::time::SystemTime,
-    completion_times: &CompletionTimes,
-    active_threads_count: usize,
-    hosts_processed: usize,
-) -> (usize, f32, String) {
-    let updated_hosts_left = hosts_left - hosts_processed;
-    let hosts_left_pct = updated_hosts_left as f32 / hosts_total as f32 * 100.0;
-    let elapsed_secs = start_time.elapsed().unwrap().as_secs() as f32;
+    pub fn calculate_wma_eta(&self, hosts_left: usize) -> f32 {
+        let mut sum_weights = 0;
+        let mut weighted_sum = time::Duration::ZERO;
 
-    let eta_str: String = if hosts_left_pct <= 99.0 && elapsed_secs > 4.0 {
-        let eta_wma = calculate_wma_eta(completion_times, active_threads_count, updated_hosts_left);
-        let hosts_done = hosts_total - updated_hosts_left;
-        let eta_avg_rate = updated_hosts_left as f32 / (hosts_done as f32 / elapsed_secs);
-        let eta = (eta_wma + eta_avg_rate) / 2.0;
-        // let eta = eta_wma;
-        let eta_m = eta as u32 / 60;
-        let eta_s = eta % 60.0;
+        for (i, &time) in self.completion_times.durations.iter().enumerate() {
+            let weight = (i + 1).pow(2) as u32;
+            sum_weights += weight;
+            weighted_sum += time * weight;
+        }
 
-        // Signify slope direction with one or more arrows, depending on
-        // direction and magnitude (→, ⇗, ↑, ↑↑, ⇘, ↓, ↓↓).
-        let slope_ratio = eta_wma / eta_avg_rate;
-        let slope_direction = if slope_ratio > 1.5 {
-            "↑↑"
-        } else if slope_ratio > 1.25 {
-            " ↑"
-        } else if slope_ratio > 1.0 {
-            " ⇗"
-        } else if slope_ratio < 0.666 {
-            "↓↓"
-        } else if slope_ratio < 0.75 {
-            "↓ "
-        } else if slope_ratio < 0.8 {
-            "⇘ "
+        // This is to account for the case where there were no completions in
+        // a while and the completion times are not representative of the current
+        // rate (long tail distribution). Add a fake completion time for each
+        // active thread.
+        // FIXME: This does not sound right. Shouldn't we add just one fake?
+        let last_completion_secs_ago = self.completion_times.last_update.elapsed().as_secs_f32();
+        if last_completion_secs_ago > 2.0 {
+            let fake_completion_times_count =
+                self.completion_times.durations.len() + self.active_threads;
+            for i in self.completion_times.durations.len()..fake_completion_times_count {
+                let weight = (i + 1).pow(2) as u32;
+                sum_weights += weight;
+                weighted_sum += time::Duration::from_secs_f32(last_completion_secs_ago) * weight;
+            }
+        }
+
+        let weighted_avg_time_per_thread = weighted_sum / sum_weights;
+        (weighted_avg_time_per_thread.as_secs_f32() * hosts_left as f32)
+            / self.active_threads as f32
+    }
+
+    pub fn calculate_progress(&self, hosts_left: usize) -> (usize, f32, String) {
+        let updated_hosts_left = hosts_left;
+        let hosts_left_pct = updated_hosts_left as f32 / self.hosts_total as f32 * 100.0;
+        let elapsed_secs = self.start_time.elapsed().as_secs_f32();
+
+        let eta_str: String = if hosts_left_pct <= 99.0 && elapsed_secs > 4.0 {
+            let eta_wma = self.calculate_wma_eta(updated_hosts_left);
+            let hosts_done = self.hosts_total - updated_hosts_left;
+            let eta_avg_rate = updated_hosts_left as f32 / (hosts_done as f32 / elapsed_secs);
+            let eta = (eta_wma + eta_avg_rate) / 2.0;
+            let eta_m = eta as u32 / 60;
+            let eta_s = eta % 60.0;
+
+            format!(
+                "{:02}m{:02.0}s({:2.1}|{:2.1})",
+                eta_m, eta_s, eta_wma, eta_avg_rate
+            )
         } else {
-            "→ "
+            "??m??s".to_string()
         };
-        /*
-                format!(
-                    "{:02}m{:02.0}s({:2.1}|{:2.1}){}{}s",
-                    eta_m, eta_s, eta_wma, eta_avg_rate, slope_direction, elapsed_secs
-                )
-        */
-        format!(
-            "{:02}m{:02.0}s({:2.1}|{:2.1})",
-            eta_m, eta_s, eta_wma, eta_avg_rate
-        )
-    } else {
-        "??m??s".to_string() // ;
-    };
 
-    (updated_hosts_left, hosts_left_pct, eta_str)
+        (updated_hosts_left, hosts_left_pct, eta_str)
+    }
 }
 
-fn print_output(
+pub fn print_output(
     host: &str,
     out: String,
     exit_status: i32,
@@ -160,13 +150,12 @@ fn print_output(
 ) {
     let text: String = if out.is_empty() {
         if exit_status == 0 {
-            // this code is duplicated bellow
             eprint!("{:>4.1}% / {:>5}\r", hosts_left_pct, eta_str);
             return;
         }
-        "\n".to_string() // ;
+        "\n".to_string()
     } else {
-        out // ;
+        out
     };
 
     let delim_text;
@@ -180,16 +169,15 @@ fn print_output(
     }
 
     let delim = if atty::is(Stream::Stdout) {
-        format!("{}", delim_ansi) // ;
+        format!("{}", delim_ansi)
     } else {
-        delim_text.to_string() // ;
+        delim_text.to_string()
     };
 
     let stdout = std::io::stdout();
     let mut stdout_handle = stdout.lock();
     for line in text.lines() {
         if !atty::is(Stream::Stdout) && atty::is(Stream::Stderr) {
-            // this code is duplicated above
             eprint!("{:>4.1}% / {:>5}\r", hosts_left_pct, eta_str);
         }
         let write_result = writeln!(
@@ -218,14 +206,9 @@ fn spawn_print_thread(
     host_max_width: usize,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let start_time = std::time::SystemTime::now();
-        let mut hosts_left = hosts_total;
-        let mut completion_times = CompletionTimes {
-            durations: Vec::new(),
-            last_update: time::Instant::now(),
-        };
-        let mut active_threads_cache: usize = 0;
+        let mut progress_tracker = ProgressTracker::new(hosts_total);
 
+        let mut hosts_left = hosts_total;
         let mut interval = tokio::time::interval(time::Duration::from_secs(1));
 
         loop {
@@ -233,7 +216,6 @@ fn spawn_print_thread(
                 msg = rx.recv() => {
                     match msg {
                         Some((host, mut out, exit_status, thread_elapsed, active_threads)) => {
-                            active_threads_cache = active_threads;
 
                         // Exit if the print thread receives the exit code from the
                         // main thread. This is a hack, but exiting is the only
@@ -280,17 +262,11 @@ fn spawn_print_thread(
                             out.take();
                         }
 
-                        completion_times.durations.push(thread_elapsed);
-                        completion_times.last_update = time::Instant::now();
+                        progress_tracker.update_completion(thread_elapsed);
+                        progress_tracker.update_active_threads(active_threads);
 
-                        // Calculate progress and ETA by calling:
-                        let (hosts_left_updated, hosts_left_pct, eta_str) = calculate_progress(
-                            hosts_total,
-                            hosts_left,
-                            start_time,
-                            &completion_times,
-                            active_threads_cache,
-                            1, // One new host processed
+                        let (hosts_left_updated, hosts_left_pct, eta_str) = progress_tracker.calculate_progress(
+                            hosts_left - 1
                         );
                         hosts_left = hosts_left_updated;
 
@@ -312,17 +288,9 @@ fn spawn_print_thread(
             } // tokio::select
 
             _ = interval.tick() => {
-                            // Handle periodic progress updates here
-                            // Calculate progress and print it even though no new message was received
-                            let (hosts_left_updated, hosts_left_pct, eta_str) = calculate_progress(
-                                hosts_total,
-                                hosts_left,
-                                start_time,
-                                &completion_times,
-                                // You might need to adjust the way active_threads is determined
-                                // since it won't be updated directly by message processing in this case
-                                active_threads_cache,
-                                0, // No new hosts processed
+                            // Handle periodic progress updates
+                            let (hosts_left_updated, hosts_left_pct, eta_str) = progress_tracker.calculate_progress(
+                                hosts_left
                             );
                             hosts_left = hosts_left_updated;
 
@@ -796,122 +764,98 @@ mod tests {
 
     #[test]
     fn test_calculate_wma_eta() {
-        let completion_times = CompletionTimes {
-            durations: vec![
-                time::Duration::from_secs(1),
-                time::Duration::from_secs(2),
-                time::Duration::from_secs(3),
-            ],
-            last_update: time::Instant::now(),
-        };
+        let mut progress_tracker = ProgressTracker::new(50);
 
-        let eta = calculate_wma_eta(&completion_times, 10, 50);
+        progress_tracker.update_completion(time::Duration::from_secs(1));
+        progress_tracker.update_completion(time::Duration::from_secs(2));
+        progress_tracker.update_completion(time::Duration::from_secs(3));
+
+        progress_tracker.update_active_threads(10);
+
+        let eta = progress_tracker.calculate_wma_eta(50);
 
         // With 3 samples of 1s, 2s, 3s
-        // Weights: 1,4,9
-        // sum_weights = 1+4+9 = 14
-        // weighted_sum = 1*1 + 2*4 + 3*9 = 1 + 8 + 27 = 36
+        // Weights: 1, 4, 9
+        // sum_weights = 1 + 4 + 9 = 14
+        // weighted_sum = 1 * 1 + 2 * 4 + 3 * 9 = 1 + 8 + 27 = 36
         // Expected weighted avg: 36/14 = 2.57s
         // Expected ETA = 2.57s * 50 hosts / 10 threads = 12.85s
         assert!((eta - 12.85).abs() < 0.1);
     }
 
     #[test]
-    fn test_calculate_wma_eta_long_tail() {
-        let completion_times = CompletionTimes {
-            durations: vec![time::Duration::from_secs(1)],
-            last_update: time::Instant::now() - time::Duration::from_secs(5),
-        };
-
-        let eta = calculate_wma_eta(&completion_times, 2, 10);
-
-        // Should account for 5s delay in last completion
-        // With 1 real sample of 1s and 2 fake samples of 5s
-        // Weights: 1,4,9
-        // sum_weights = 1+4+9 = 14
-        // weighted_sum = 1*1 + 5*4 + 5*9 = 1 + 20 + 45 = 66
-        // Expected weighted avg: 66/14 = 4.71s
-        // Expected ETA = 4.71s * 10 hosts / 2 threads = 23.55s
-        assert!((eta - 23.55).abs() < 0.1);
-    }
-
-    #[test]
     fn test_calculate_wma_eta_single_sample() {
-        let completion_times = CompletionTimes {
-            durations: vec![time::Duration::from_secs(2)],
-            last_update: time::Instant::now(),
-        };
+        let mut progress_tracker = ProgressTracker::new(20);
 
-        let eta = calculate_wma_eta(&completion_times, 5, 20);
+        progress_tracker.update_completion(time::Duration::from_secs(2));
+        progress_tracker.update_active_threads(5);
+
+        let eta = progress_tracker.calculate_wma_eta(20);
 
         // With single 2s sample
         // Expected ETA = 2s * 20 hosts / 5 threads = 8s
         assert!((eta - 8.0).abs() < 0.1);
     }
 
-    // Test the progress calculation.
-
     #[test]
-    fn test_calculate_progress_long_tail() {
-        let hosts_total = 100;
-        let hosts_left = 50;
-        let start_time = std::time::SystemTime::now();
+    fn test_calculate_wma_eta_long_tail() {
+        let mut progress_tracker = ProgressTracker::new(10);
 
-        // Create old completion time to trigger long tail handling
-        let completion_times = CompletionTimes {
-            durations: vec![time::Duration::from_secs(1)],
-            last_update: time::Instant::now() - time::Duration::from_secs(3),
-        };
+        progress_tracker.update_completion(time::Duration::from_secs(1));
+        progress_tracker.update_active_threads(2);
 
-        let (left, pct, eta) = calculate_progress(
-            hosts_total,
-            hosts_left,
-            start_time,
-            &completion_times,
-            10,
-            5,
-        );
+        // Sleep for a while to trigger long tail handling
+        std::thread::sleep(time::Duration::from_secs(3));
 
-        assert_eq!(left, 45);
-        assert!((pct - 45.0).abs() < 0.01);
-        assert!(eta.contains("m") && eta.contains("s"));
+        let eta = progress_tracker.calculate_wma_eta(10);
+
+        // Should account for the delay in last completion
+        // With 1 real sample of 1s and 2 (because of 2 active threads) fake samples of 3s
+        // Weights: 1, 4, 9
+        // sum_weights = 1 + 4 + 9 = 14
+        // weighted_sum = 1 * 1 + 3 * 4 + 3 * 9 = 1 + 12 + 27 = 40
+        // Expected weighted avg: 40/14 = 2.86s
+        // Expected ETA = 2.86s * 10 hosts / 2 threads = 14.3s
+        assert!((eta - 14.3).abs() < 0.1);
     }
+
+    // Test the ProgressTracker::calculate_progress() method.
 
     #[test]
     fn test_calculate_progress_early_stage() {
-        let start_time = std::time::SystemTime::now();
-        let completion_times = CompletionTimes {
-            durations: vec![
-                time::Duration::from_secs(1),
-                time::Duration::from_secs(1),
-                time::Duration::from_secs(1),
-            ],
-            last_update: time::Instant::now(),
-        };
-        let (left, pct, eta) = calculate_progress(100, 99, start_time, &completion_times, 10, 1);
+        let mut progress_tracker = ProgressTracker::new(100);
 
-        assert_eq!(left, 98);
-        assert_eq!(pct, 98.0);
+        progress_tracker.update_completion(time::Duration::from_secs(1));
+        progress_tracker.update_completion(time::Duration::from_secs(1));
+        progress_tracker.update_completion(time::Duration::from_secs(1));
+
+        progress_tracker.update_active_threads(1);
+
+        let (left, pct, eta) = progress_tracker.calculate_progress(97);
+
+        assert_eq!(left, 97);
+        assert_eq!(pct, 97.0);
         assert_eq!(eta, "??m??s"); // Too early for ETA
     }
 
     #[test]
     fn test_calculate_progress_almost_done() {
-        let start_time = std::time::SystemTime::now() - std::time::Duration::from_secs(10);
-        let completion_times = CompletionTimes {
-            durations: vec![
-                time::Duration::from_secs(1),
-                time::Duration::from_secs(1),
-                time::Duration::from_secs(1),
-            ],
-            last_update: time::Instant::now(),
-        };
+        let mut progress_tracker = ProgressTracker::new(10);
 
-        let (left, pct, eta) = calculate_progress(100, 2, start_time, &completion_times, 2, 1);
+        // Time calculation happens after at least 4s.
+        for _ in 0..9 {
+            progress_tracker.update_completion(time::Duration::from_secs(1));
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+
+        progress_tracker.update_active_threads(1);
+
+        let (left, pct, eta) = progress_tracker.calculate_progress(1);
+        eprintln!("left: {}, pct: {}, eta: {}", left, pct, eta);
 
         assert_eq!(left, 1);
-        assert_eq!(pct, 1.0);
-        assert!(eta.contains("m") && eta.contains("s"));
+        assert_eq!(pct, 10.0);
+        assert!(eta.starts_with("00m01s"));
     }
 
     // Test the spawn_print_thread() function.
