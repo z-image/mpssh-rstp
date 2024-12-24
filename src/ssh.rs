@@ -174,13 +174,17 @@ async fn exchange_ssh_agent_message(data: &[u8]) -> std::io::Result<Vec<u8>> {
 struct Client {
     agent_channel: Option<ChannelId>,
     buffer: Mutex<Vec<u8>>,
+    host: String,
+    port: u16,
 }
 
 impl Client {
-    pub fn new() -> Self {
+    pub fn new(host: &str, port: u16) -> Self {
         Self {
             agent_channel: None,
             buffer: Mutex::new(Vec::new()),
+            host: host.to_string(),
+            port,
         }
     }
 }
@@ -189,14 +193,18 @@ impl Client {
 impl client::Handler for Client {
     type Error = russh::Error;
 
-    /// Callback to check the server's public key.
-    ///
-    /// FIXME: This is a dummy implementation. We should actually check the server's public key.
+    /// Callback to check the server's public key against a known_hosts file.
     async fn check_server_key(
         &mut self,
-        _server_public_key: &ssh_key::PublicKey,
+        server_public_key: &ssh_key::PublicKey,
     ) -> Result<bool, Self::Error> {
-        Ok(true)
+        let result = russh_keys::check_known_hosts(&self.host, self.port, server_public_key);
+        log::debug!("check_server_key: {:?}", result);
+
+        match result {
+            Ok(true) => Ok(true),
+            _ => Ok(false),
+        }
     }
 
     /// Callback to handle an agent forwarding channel open request.
@@ -299,7 +307,7 @@ impl RemoteExecutor for RusshExecutor {
         let ssh_config = client::Config::default();
         let config = Arc::new(ssh_config);
 
-        let handler = Client::new();
+        let handler = Client::new(&self.config.host, self.config.port);
 
         let mut session =
             russh::client::connect(config, (&self.config.host[..], self.config.port), handler)
