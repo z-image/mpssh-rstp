@@ -464,6 +464,14 @@ pub async fn execute(
     remote_user: &str,
     backend: &SshBackend,
 ) -> (Option<String>, i32) {
+    log::debug!(
+        "Executing command '{}' on {}@{} using {}",
+        command,
+        remote_user,
+        remote_host,
+        backend
+    );
+
     let server_config = ServerConfig {
         host: remote_host.to_string(),
         port: 22,
@@ -509,13 +517,7 @@ impl RemoteExecutor for LibSsh2Executor {
         let remote_host = &self.config.host;
         let remote_user = &self.config.username;
 
-        let (output, exit_code) = execute_libssh2(remote_host, command, remote_user);
-
-        Ok(CommandResult {
-            stdout: output.unwrap().into_bytes(),
-            stderr: Vec::new(),
-            exit_code: exit_code as u32,
-        })
+        execute_libssh2(remote_host, command, remote_user)
     }
 }
 
@@ -523,7 +525,7 @@ pub fn execute_libssh2(
     remote_host: &str,
     command: &str,
     remote_user: &str,
-) -> (Option<String>, i32) {
+) -> Result<CommandResult> {
     let remote_port = "22";
     let remote_addr = remote_host.to_owned() + ":" + remote_port;
 
@@ -535,7 +537,11 @@ pub fn execute_libssh2(
     ) {
         Ok(stream) => stream,
         Err(_) => {
-            return (None, 1);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "connection refused",
+            )
+            .into());
         }
     };
 
@@ -544,7 +550,7 @@ pub fn execute_libssh2(
         Ok(sess) => sess,
         Err(e) => {
             log::error!("Failed to create SSH session: {}", e);
-            return (None, 1);
+            return Err(e.into());
         }
     };
 
@@ -553,7 +559,7 @@ pub fn execute_libssh2(
         Ok(agent) => agent,
         Err(e) => {
             log::error!("Failed to create SSH agent session: {}", e);
-            return (None, 1);
+            return Err(e.into());
         }
     };
 
@@ -575,7 +581,7 @@ pub fn execute_libssh2(
         remote_host,
     ) {
         log::error!("Failed to list agent identities: {}", e);
-        return (None, 1);
+        return Err(e.into());
     }
 
     // Associate the TCP stream with the SSH session; no error handling needed
@@ -587,7 +593,7 @@ pub fn execute_libssh2(
         Ok(_) => {}
         Err(e) => {
             log::error!("Failed to set preferred host key type: {}", e);
-            return (None, 1);
+            return Err(e.into());
         }
     }
 
@@ -598,7 +604,7 @@ pub fn execute_libssh2(
         Ok(_) => {}
         Err(e) => {
             log::error!("SSH handshake failure: {}", e);
-            return (None, 1);
+            return Err(e.into());
         }
     }
 
@@ -613,7 +619,9 @@ pub fn execute_libssh2(
 
     // Check the public key of the remote host.
     if check_known_host(&sess, remote_host).is_err() {
-        return (None, 1);
+        return Err(
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "host key mismatch").into(),
+        );
     }
 
     // Try to authenticate with the first identity in the agent.
@@ -640,7 +648,10 @@ pub fn execute_libssh2(
 
     if !agent_auth_success {
         log::error!("fatal failure {} for {}", agent_auth_error, remote_host);
-        return (None, 1);
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "agent authentication failure",
+        ).into());
     }
 
     // Create the SSH channel.
@@ -663,5 +674,9 @@ pub fn execute_libssh2(
 
     let exit_status = channel.exit_status().unwrap();
 
-    (Some(out), exit_status)
+    Ok(CommandResult {
+        stdout: out.into_bytes(),
+        stderr: Vec::new(),
+        exit_code: exit_status as u32,
+    })
 }
