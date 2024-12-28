@@ -3,7 +3,6 @@ use std::fmt;
 use std::io::Read;
 use std::net::TcpStream;
 use std::path::Path;
-use std::thread;
 use std::time;
 
 // <russh> ////////////////////////////////////////////////////////////////
@@ -307,12 +306,26 @@ impl RemoteExecutor for RusshExecutor {
         let ssh_config = client::Config::default();
         let config = Arc::new(ssh_config);
 
-        let handler = Client::new(&self.config.host, self.config.port);
+        let remote_tuple = format!("{}:{}", self.config.host, self.config.port);
+        let mut session = retry(
+            || async {
+                let handler = Client::new(&self.config.host, self.config.port);
 
-        let mut session =
-            russh::client::connect(config, (&self.config.host[..], self.config.port), handler)
-                .await?;
-        log::debug!("Connected");
+                tokio::time::timeout(
+                    // Typical TCP retry interval is 1s, 2s, 4s, 8s, 16s, ...
+                    time::Duration::from_secs(5),
+                    russh::client::connect(
+                        config.clone(),
+                        (&self.config.host[..], self.config.port),
+                        handler,
+                    ),
+                ).await?
+
+            },
+            "SSH connection to ",
+            &remote_tuple,
+        )
+        .await?;
 
         // Authenticate with password if provided, otherwise use the default key.
         let auth_result;
@@ -372,9 +385,12 @@ impl RemoteExecutor for RusshExecutor {
 
 // </russh> ///////////////////////////////////////////////////////////////
 
-fn retry<T, F, E>(mut operation: F, op_name: &str, op_arg: &str) -> Result<T, E>
+// <utils> ////////////////////////////////////////////////////////////////
+
+async fn retry<T, F, Fut, E>(mut operation: F, op_name: &str, op_arg: &str) -> Result<T, E>
 where
-    F: FnMut() -> Result<T, E>,
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
     E: std::fmt::Display,
 {
     let delay_base_ms = 1000;
@@ -384,7 +400,7 @@ where
     loop {
         attempt += 1;
 
-        match operation() {
+        match operation().await {
             Ok(result) => return Ok(result),
             Err(e) => {
                 if attempt >= limit {
@@ -400,11 +416,13 @@ where
                     retry_delay_ms / 1000
                 );
 
-                thread::sleep(time::Duration::from_millis(retry_delay_ms));
+                tokio::time::sleep(time::Duration::from_millis(retry_delay_ms)).await;
             }
         }
     }
 }
+
+// </utils> ///////////////////////////////////////////////////////////////
 
 fn check_known_host(session: &ssh2::Session, host: &str) -> Result<(), std::io::Error> {
     let mut known_hosts = session.known_hosts().unwrap();
@@ -517,31 +535,34 @@ impl RemoteExecutor for LibSsh2Executor {
         let remote_host = &self.config.host;
         let remote_user = &self.config.username;
 
-        execute_libssh2(remote_host, command, remote_user)
+        execute_libssh2(remote_host, command, remote_user).await
     }
 }
 
-pub fn execute_libssh2(
+pub async fn execute_libssh2(
     remote_host: &str,
     command: &str,
     remote_user: &str,
 ) -> Result<CommandResult> {
     let remote_port = "22";
-    let remote_addr = remote_host.to_owned() + ":" + remote_port;
+    let remote_tuple = remote_host.to_owned() + ":" + remote_port;
 
     // Create a TCP connection to the remote host.
-    let stream = match retry(
-        || TcpStream::connect(&remote_addr),
+    let result = retry(
+        || async {
+            log::debug!("Attempting to connect to {}", remote_tuple);
+            TcpStream::connect(&remote_tuple)
+        },
         "TCP connection to ",
-        remote_addr.as_str(),
-    ) {
+        remote_tuple.as_str(),
+    )
+    .await;
+
+    let stream = match result {
         Ok(stream) => stream,
-        Err(_) => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::ConnectionRefused,
-                "connection refused",
-            )
-            .into());
+        Err(e) => {
+            log::error!("Failed to connect to {}: {}", remote_tuple, e);
+            return Err(e.into());
         }
     };
 
@@ -555,7 +576,7 @@ pub fn execute_libssh2(
     };
 
     // Create a new SSH agent session.
-    let mut agent = match sess.agent() {
+    let agent_in = match sess.agent() {
         Ok(agent) => agent,
         Err(e) => {
             log::error!("Failed to create SSH agent session: {}", e);
@@ -563,23 +584,22 @@ pub fn execute_libssh2(
         }
     };
 
+    let agent_arc = Arc::new(Mutex::new(agent_in));
+
     // Connect to the agent and request a list of identities.
-    let agent_identities = || {
-        agent.connect().unwrap();
-        match agent.list_identities() {
+    let agent_identities = || async {
+        let mut agent_clone = agent_arc.lock().await;
+        agent_clone.connect().unwrap();
+        match agent_clone.list_identities() {
             Ok(_) => Ok(()),
             Err(e) => {
-                agent.disconnect().unwrap();
+                agent_clone.disconnect().unwrap();
                 Err(e)
             }
         }
     };
 
-    if let Err(e) = retry(
-        agent_identities,
-        "agent.list_identities() for ",
-        remote_host,
-    ) {
+    if let Err(e) = retry(agent_identities, "agent.list_identities() for ", remote_host).await {
         log::error!("Failed to list agent identities: {}", e);
         return Err(e.into());
     }
@@ -627,12 +647,13 @@ pub fn execute_libssh2(
     // Try to authenticate with the first identity in the agent.
     let mut agent_auth_success = false;
     let mut agent_auth_error: String = "".to_string();
-    for identity in agent.identities().unwrap() {
-        match agent.userauth(remote_user, &identity) {
+    let mut agent_clone = agent_arc.lock().await;
+    for identity in agent_clone.identities().unwrap() {
+        match agent_clone.userauth(remote_user, &identity) {
             Ok(_) => {
                 log::debug!("agent success for {}", identity.comment());
                 agent_auth_success = true;
-                agent.disconnect().unwrap();
+                agent_clone.disconnect().unwrap();
                 break;
             }
             Err(error) => {
@@ -651,7 +672,8 @@ pub fn execute_libssh2(
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "agent authentication failure",
-        ).into());
+        )
+        .into());
     }
 
     // Create the SSH channel.
@@ -679,4 +701,33 @@ pub fn execute_libssh2(
         stderr: Vec::new(),
         exit_code: exit_status as u32,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tracing_log::LogTracer;
+    use tracing_test::traced_test;
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_retry() {
+        LogTracer::init().expect("Failed to initialize LogTracer");
+
+        let result = retry(
+            || async {
+                log::info!("Attempting operation");
+                Err::<(), _>(std::io::Error::new(std::io::ErrorKind::Other, "failed"))
+            },
+            "op_test:",
+            "op_arg",
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(logs_contain("op_test:op_arg error 1/4, will retry in 1s"));
+        assert!(logs_contain("op_test:op_arg error 2/4, will retry in 4s"));
+        assert!(logs_contain("op_test:op_arg error 3/4, will retry in 9s"));
+        assert!(logs_contain("op_test:op_arg failure 4/4: failed"));
+    }
 }
