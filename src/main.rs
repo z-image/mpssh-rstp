@@ -8,7 +8,6 @@
  * See --help for usage.
  *
  * TODO:
- *  - Do not print progress to stdout if not a tty.
  *  - How to see which hosts are in progress now with async?
  *   - This was easy with threads (prctl::set_name()).
  *  - Progress ETA is not coping well with long tail distribution of slow hosts.
@@ -141,6 +140,43 @@ impl ProgressTracker {
     }
 }
 
+// Extract formatting to a testable function
+pub fn format_output_line(
+    host: &str,
+    line: &str,
+    exit_status: i32,
+    host_max_width: usize,
+    hosts_left_pct: f32,
+    eta_str: &str,
+    is_tty: bool,
+) -> String {
+    let delim_text = if exit_status == 0 { "->" } else { "=>" };
+    let delim = if is_tty {
+        let color = if exit_status == 0 {
+            Colour::Fixed(10)
+        } else {
+            Colour::Fixed(9)
+        };
+        format!("{}", color.paint(delim_text))
+    } else {
+        delim_text.to_string()
+    };
+
+    // Pre-format the host part with consistent width
+    let host_part = format!("{:<width$}", host, width = host_max_width);
+
+    if !is_tty {
+        // For non-tty stdout, use simplified output without progress info
+        format!("{} {} {}", host_part, delim, line)
+    } else {
+        // For tty stdout, include progress information
+        format!(
+            "{} {:>4.1}%-{}{} {}",
+            host_part, hosts_left_pct, eta_str, delim, line
+        )
+    }
+}
+
 pub fn print_output(
     host: &str,
     out: String,
@@ -149,9 +185,36 @@ pub fn print_output(
     hosts_left_pct: f32,
     eta_str: String,
 ) {
+    // Use the existing function with atty::is(Stream::Stdout)
+    print_output_with_tty(
+        host,
+        out,
+        exit_status,
+        host_max_width,
+        hosts_left_pct,
+        eta_str,
+        atty::is(Stream::Stdout),
+        atty::is(Stream::Stderr),
+    )
+}
+
+// Separate function that allows injecting the TTY status
+pub fn print_output_with_tty(
+    host: &str,
+    out: String,
+    exit_status: i32,
+    host_max_width: usize,
+    hosts_left_pct: f32,
+    eta_str: String,
+    stdout_is_tty: bool,
+    stderr_is_tty: bool,
+) {
     let text: String = if out.is_empty() {
         if exit_status == 0 {
-            eprint!("{:>4.1}% / {:>5}\r", hosts_left_pct, eta_str);
+            // Only print progress to stderr if it's a tty
+            if stderr_is_tty {
+                eprint!("{:>4.1}% / {:>5}\r", hosts_left_pct, eta_str);
+            }
             return;
         }
         "\n".to_string()
@@ -159,40 +222,25 @@ pub fn print_output(
         out
     };
 
-    let delim_text;
-    let delim_ansi;
-    if exit_status == 0 {
-        delim_text = "->";
-        delim_ansi = Colour::Fixed(10).paint(delim_text);
-    } else {
-        delim_text = "=>";
-        delim_ansi = Colour::Fixed(9).paint(delim_text);
-    }
-
-    let delim = if atty::is(Stream::Stdout) {
-        format!("{}", delim_ansi)
-    } else {
-        delim_text.to_string()
-    };
-
     let stdout = std::io::stdout();
     let mut stdout_handle = stdout.lock();
     for line in text.lines() {
-        if !atty::is(Stream::Stdout) && atty::is(Stream::Stderr) {
+        // Update progress on stderr if it's a tty, even when stdout isn't
+        if !stdout_is_tty && stderr_is_tty {
             eprint!("{:>4.1}% / {:>5}\r", hosts_left_pct, eta_str);
         }
-        let write_result = writeln!(
-            &mut stdout_handle,
-            "{:width$} {:>4.1}%-{:>5}{} {}",
+
+        let output_line = format_output_line(
             host,
-            hosts_left_pct,
-            eta_str,
-            delim,
             line,
-            width = host_max_width
+            exit_status,
+            host_max_width,
+            hosts_left_pct,
+            &eta_str,
+            stdout_is_tty,
         );
 
-        if let Err(e) = write_result {
+        if let Err(e) = writeln!(&mut stdout_handle, "{}", output_line) {
             log::error!("Failed to write to stdout: {}", e);
             panic!("Error writing to stdout: {}", e);
         }
@@ -889,5 +937,89 @@ mod tests {
         .unwrap();
 
         print_thread.await.unwrap();
+    }
+
+    #[test]
+    fn test_format_output_line_tty() {
+        let host = "testhost";
+        let line = "test output";
+        let exit_status = 0;
+        let host_max_width = 10;
+        let hosts_left_pct = 50.0;
+        let eta_str = "01m30s";
+        let is_tty = true;
+
+        let formatted = format_output_line(
+            host,
+            line,
+            exit_status,
+            host_max_width,
+            hosts_left_pct,
+            eta_str,
+            is_tty,
+        );
+
+        // For TTY output, verify it contains progress information
+        assert!(formatted.contains("50.0%"));
+        assert!(formatted.contains("01m30s"));
+        assert!(formatted.contains(host));
+        assert!(formatted.contains(line));
+    }
+
+    #[test]
+    fn test_format_output_line_non_tty() {
+        let host = "testhost";
+        let line = "test output";
+        let exit_status = 0;
+        let host_max_width = 10;
+        let hosts_left_pct = 50.0;
+        let eta_str = "01m30s";
+        let is_tty = false;
+
+        let formatted = format_output_line(
+            host,
+            line,
+            exit_status,
+            host_max_width,
+            hosts_left_pct,
+            eta_str,
+            is_tty,
+        );
+
+        // For non-TTY output, verify it doesn't contain progress information
+        assert!(!formatted.contains("50.0%"));
+        assert!(!formatted.contains("01m30s"));
+        assert!(formatted.contains(host));
+        assert!(formatted.contains(line));
+        assert!(formatted.contains("->"));
+
+        // Verify format is simpler
+        let expected = format!("{:<width$} -> {}", host, line, width = host_max_width);
+        assert_eq!(formatted, expected);
+    }
+
+    #[test]
+    fn test_format_output_line_error_status() {
+        let host = "testhost";
+        let line = "test output";
+        let exit_status = 1; // Error status
+        let host_max_width = 10;
+        let hosts_left_pct = 50.0;
+        let eta_str = "01m30s";
+        let is_tty = false;
+
+        let formatted = format_output_line(
+            host,
+            line,
+            exit_status,
+            host_max_width,
+            hosts_left_pct,
+            eta_str,
+            is_tty,
+        );
+
+        // Verify error delimiter
+        assert!(formatted.contains("=>"));
+        assert!(!formatted.contains("->"));
     }
 }
