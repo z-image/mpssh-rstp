@@ -8,14 +8,15 @@
  * See --help for usage.
  *
  * TODO:
+ *  - Do not print progress to stdout if not a tty.
+ *  - How to see which hosts are in progress now with async?
+ *   - This was easy with threads (prctl::set_name()).
  *  - Progress ETA is not coping well with long tail distribution of slow hosts.
  *  - Add option to add host keys to known_hosts
  *  - Split stdout / stderr?
- *  - auth agent forwarding
- *   - maybe switch to russh?
- *    - see server_channel_open_agent_forward() handler
- *  - support tail -f
+ *  - Support tail -f
  *  - -u mandatory?
+ *  - File upload support?
  */
 
 mod ssh;
