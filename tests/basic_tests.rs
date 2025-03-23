@@ -8,6 +8,8 @@ use tracing_test::traced_test;
 async fn test_command_execution_bad_host_retries() {
     log::info!("Starting test_command_execution_bad_host_retries");
 
+    let _ = tracing_log::LogTracer::init(); // Needed for logs_contain()
+
     let backends = vec![ssh::SshBackend::Russh, ssh::SshBackend::LibSsh2];
 
     for backend in backends {
@@ -23,6 +25,7 @@ async fn test_command_execution_bad_host_retries() {
             .unwrap()
             .contains("Temporary failure in name resolution"));
         assert_eq!(exit_code, 1);
+
         let msg = format!(
             "Executing command 'echo Hello' on user@bad_host using {}",
             backend
