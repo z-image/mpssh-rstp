@@ -313,7 +313,7 @@ impl RemoteExecutor for RusshExecutor {
 
                 tokio::time::timeout(
                     // Typical TCP retry interval is 1s, 2s, 4s, 8s, 16s, ...
-                    time::Duration::from_secs(5),
+                    time::Duration::from_secs(10),
                     russh::client::connect(
                         config.clone(),
                         (&self.config.host[..], self.config.port),
@@ -403,6 +403,12 @@ where
         match operation().await {
             Ok(result) => return Ok(result),
             Err(e) => {
+                // Fail fast if the operation is not retryable
+                if e.to_string().contains("Unknown server key") {
+                    log::error!("{op_name}{op_arg} failure: {e}");
+                    return Err(e);
+                }
+
                 if attempt >= limit {
                     log::error!("{op_name}{op_arg} failure {attempt}/{limit}: {e}");
                     return Err(e);
@@ -519,8 +525,7 @@ pub async fn execute(
             (Some(output_str), res.exit_code as i32)
         }
         Err(e) => {
-            log::error!("execution error: {}", e);
-            (None, 1)
+            (Some(e.to_string()), 1)
         }
     }
 }
