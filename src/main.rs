@@ -8,6 +8,7 @@
  * See --help for usage.
  *
  * TODO:
+ *  - Russh backend silently returns empty output (exit 0) on channel errors (e.g., very long commands)
  *  - Add support for ignoring errors / timeouts per host.
  *   - I.e. when we know some hosts are flaky: try them, but with shorter timeout and ignore
  *   errors? Mandatory end date, so we do not forgot some hosts like that forever. The alternative
