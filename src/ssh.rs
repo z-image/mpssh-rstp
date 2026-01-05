@@ -679,23 +679,21 @@ pub async fn execute_libssh2(
     }
 
     // Create the SSH channel.
-    let mut channel = sess.channel_session().unwrap();
+    let mut channel = sess.channel_session()?;
     // TODO: agent forwarding
 
-    channel
-        .handle_extended_data(ssh2::ExtendedData::Merge)
-        .unwrap();
+    channel.handle_extended_data(ssh2::ExtendedData::Merge)?;
 
     // Execute command on the remote host.
-    channel.exec(command).unwrap();
+    channel.exec(command)?;
 
     let mut out = String::new();
-    channel.read_to_string(&mut out).unwrap();
+    channel.read_to_string(&mut out)?;
 
-    channel.close().unwrap();
-    channel.wait_close().unwrap();
+    channel.close()?;
+    channel.wait_close()?;
 
-    let exit_status = channel.exit_status().unwrap();
+    let exit_status = channel.exit_status()?;
 
     Ok(CommandResult {
         stdout: out.into_bytes(),
