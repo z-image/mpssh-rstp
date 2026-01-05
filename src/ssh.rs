@@ -459,10 +459,7 @@ fn check_known_host(session: &ssh2::Session, host: &str) -> Result<(), std::io::
         }
         ssh2::CheckResult::Failure => {
             log::error!("{} check failed", host);
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "host check failed",
-            ))
+            Err(std::io::Error::other("host check failed"))
         }
     }
 }
@@ -684,7 +681,6 @@ pub async fn execute_libssh2(
     // Create the SSH channel.
     let mut channel = sess.channel_session().unwrap();
     // TODO: agent forwarding
-    // channel.request_auth_agent_forwarding().unwrap();
 
     channel
         .handle_extended_data(ssh2::ExtendedData::Merge)

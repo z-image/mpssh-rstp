@@ -8,6 +8,10 @@
  * See --help for usage.
  *
  * TODO:
+ *  - Add support for ignoring errors / timeouts per host.
+ *   - I.e. when we know some hosts are flaky: try them, but with shorter timeout and ignore
+ *   errors? Mandatory end date, so we do not forgot some hosts like that forever. The alternative
+ *   would be to exclude them from the host list, but this would be less convenient.
  *  - How to see which hosts are in progress now with async?
  *   - This was easy with threads (prctl::set_name()).
  *  - Progress ETA is not coping well with long tail distribution of slow hosts.
@@ -381,7 +385,7 @@ fn process_args(args: Option<Vec<&str>>) -> clap::ArgMatches<'static> {
     let matches = App::new("Mass parallel SSH in Rust")
         .version(VERSION)
         .author(AUTHOR)
-        .about("\nExecutes an SSH command simulatenously on many hosts.")
+        .about("\nExecutes an SSH command simultaneously on many hosts.")
         .setting(AppSettings::AllowExternalSubcommands)
         .setting(AppSettings::AllArgsOverrideSelf)
         .arg(
@@ -565,15 +569,7 @@ async fn run(config: Config) {
     let parallel_sessions = config.parallel_sessions;
     let delay = config.delay;
     let remote_command = config.remote_command;
-    let mut remote_user = config.remote_user;
-
-    if remote_user.is_empty() {
-        remote_user = match users::get_current_username() {
-            Some(username) => username.into_string().unwrap(),
-            None => panic!("The current user does not exist!"),
-        };
-    }
-
+    let remote_user = config.remote_user;
     let ssh_backend = config.ssh_backend;
 
     if config.write_to_file {
