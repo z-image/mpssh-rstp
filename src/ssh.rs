@@ -711,7 +711,7 @@ mod tests {
     #[tokio::test]
     #[traced_test]
     async fn test_retry() {
-        LogTracer::init().expect("Failed to initialize LogTracer");
+        let _ = LogTracer::init(); // Ignore if already initialized
 
         let result = retry(
             || async {
