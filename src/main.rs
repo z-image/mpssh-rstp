@@ -49,7 +49,7 @@ use tokio::sync::{mpsc, Semaphore};
 
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-const VERSION: &str = "0.93";
+const VERSION: &str = "0.93.1";
 const AUTHOR: &str = "Teodor Milkov <tm@del.bg>";
 
 enum PrintThreadMsg {
