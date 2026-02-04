@@ -462,6 +462,10 @@ impl RemoteExecutor for LibSsh2Executor {
     }
 }
 
+// TODO: libssh2 backend is very slow under high parallelism because it uses
+// blocking I/O (std::net::TcpStream, sess.handshake(), channel.read_to_string(), etc.)
+// wrapped in async. This ties up tokio worker threads and serializes the work.
+// Fix: wrap the entire function body in tokio::task::spawn_blocking().
 pub async fn execute_libssh2(
     remote_host: &str,
     command: &str,

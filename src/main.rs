@@ -8,9 +8,9 @@
  * See --help for usage.
  *
  * TODO:
+ *  - libssh2 backend is very slow - uses blocking I/O, needs spawn_blocking() (see ssh.rs)
  *  - Russh backend silently returns empty output (exit 0) on channel errors (e.g., very long commands)
  *  - Refactor print_output_with_tty() - 8 args is too many (clippy warning)
- *  - Remove or gate parse_agent_message() in ssh.rs - debug-only, unused for logic
  *  - Add support for ignoring errors / timeouts per host.
  *   - I.e. when we know some hosts are flaky: try them, but with shorter timeout and ignore
  *   errors? Mandatory end date, so we do not forgot some hosts like that forever. The alternative
