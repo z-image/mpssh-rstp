@@ -9,115 +9,19 @@ use std::time;
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
-
 use anyhow::Result;
+use async_trait::async_trait;
 use byteorder::{BigEndian, ByteOrder};
+use russh::keys;
+use russh::{Channel, ChannelMsg};
 use russh::*;
-use russh_keys::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
-/* <ssh agent> */
+/* <ssh agent forwarding> */
 
-const SSH_AGENT_SUCCESS: u8 = 5;
-const SSH_AGENT_FAILURE: u8 = 6;
-const SSH2_AGENTC_REQUEST_IDENTITIES: u8 = 11;
-const SSH2_AGENT_IDENTITIES_ANSWER: u8 = 12;
-const SSH2_AGENTC_SIGN_REQUEST: u8 = 13;
-const SSH2_AGENT_SIGN_RESPONSE: u8 = 14;
-
-fn parse_agent_message(data: &[u8]) {
-    if data.len() < 4 {
-        log::error!("Message too short");
-        return;
-    }
-
-    // Parse the length prefix (first 4 bytes)
-    let msg_len = BigEndian::read_u32(&data[0..4]);
-    log::debug!("Message length: {}", msg_len);
-
-    if data.len() < 5 {
-        log::error!("No message type");
-        log::error!("Message: {:?}", data);
-        return;
-    }
-
-    // Get message type (5th byte)
-    let msg_type = data[4];
-
-    match msg_type {
-        SSH_AGENT_SUCCESS => {
-            log::debug!("Message type: SUCCESS");
-        }
-        SSH_AGENT_FAILURE => {
-            log::debug!("Message type: FAILURE");
-        }
-        SSH2_AGENTC_REQUEST_IDENTITIES => {
-            log::debug!("Message type: REQUEST_IDENTITIES");
-        }
-        SSH2_AGENT_IDENTITIES_ANSWER => {
-            if data.len() < 9 {
-                return;
-            }
-            let num_keys = BigEndian::read_u32(&data[5..9]);
-            log::debug!("Message type: IDENTITIES_ANSWER");
-            log::debug!("Number of keys: {}", num_keys);
-
-            // Parse each key
-            let mut pos = 9;
-            for i in 0..num_keys {
-                if pos + 4 > data.len() {
-                    break;
-                }
-
-                // Read key blob length
-                let blob_len = BigEndian::read_u32(&data[pos..pos + 4]) as usize;
-                pos += 4;
-
-                if pos + blob_len > data.len() {
-                    break;
-                }
-
-                // Parse key blob
-                let key_blob = &data[pos..pos + blob_len];
-                if let Ok(key_type) = std::str::from_utf8(&key_blob[4..]) {
-                    if let Some(end) = key_type.find('\0') {
-                        log::debug!("Key {}: type {}", i, &key_type[..end]);
-                    }
-                }
-                pos += blob_len;
-
-                // Read comment length
-                if pos + 4 > data.len() {
-                    break;
-                }
-                let comment_len = BigEndian::read_u32(&data[pos..pos + 4]) as usize;
-                pos += 4;
-
-                if pos + comment_len > data.len() {
-                    break;
-                }
-
-                // Parse comment
-                if let Ok(comment) = std::str::from_utf8(&data[pos..pos + comment_len]) {
-                    log::debug!("Key {} comment: {}", i, comment);
-                }
-                pos += comment_len;
-            }
-        }
-        SSH2_AGENTC_SIGN_REQUEST => {
-            log::debug!("Message type: SIGN_REQUEST");
-        }
-        SSH2_AGENT_SIGN_RESPONSE => {
-            log::debug!("Message type: SIGN_RESPONSE");
-        }
-        _ => {
-            log::debug!("Unknown message type: {}", msg_type);
-        }
-    }
-}
-
+/// Exchange a message with the local SSH agent.
+/// Sends the request and reads the complete response.
 async fn exchange_ssh_agent_message(data: &[u8]) -> std::io::Result<Vec<u8>> {
     let path = std::env::var("SSH_AUTH_SOCK").expect("SSH_AUTH_SOCK not set");
     let mut stream = tokio::net::UnixStream::connect(path).await?;
@@ -166,13 +70,74 @@ async fn exchange_ssh_agent_message(data: &[u8]) -> std::io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-/* </ssh agent> */
+/// Handle agent forwarding for a channel.
+/// This runs as a background task, reading from the channel and forwarding to the local agent.
+async fn handle_agent_forward_channel(mut channel: Channel<client::Msg>) {
+    log::debug!("Agent forward handler started for channel {:?}", channel.id());
+
+    let mut buffer = Vec::new();
+
+    loop {
+        match channel.wait().await {
+            Some(ChannelMsg::Data { data }) => {
+                log::debug!("Agent forward: received {} bytes", data.len());
+                buffer.extend_from_slice(&data);
+
+                // Process complete messages
+                while buffer.len() >= 4 {
+                    let msg_len = BigEndian::read_u32(&buffer[0..4]) as usize;
+
+                    if buffer.len() < msg_len + 4 {
+                        // Wait for more data
+                        break;
+                    }
+
+                    // Extract the complete message
+                    let message: Vec<u8> = buffer.drain(0..4 + msg_len).collect();
+                    log::debug!("Agent forward: processing message of length {}", msg_len);
+
+                    // Forward to local agent and send response back
+                    match exchange_ssh_agent_message(&message).await {
+                        Ok(response) => {
+                            log::debug!("Agent forward: got response of {} bytes", response.len());
+                            if let Err(e) = channel.data(&response[..]).await {
+                                log::error!("Agent forward: failed to send response: {}", e);
+                                return;
+                            }
+                        }
+                        Err(e) => {
+                            log::error!("Agent forward: failed to exchange with agent: {}", e);
+                            return;
+                        }
+                    }
+                }
+            }
+            Some(ChannelMsg::Eof) => {
+                log::debug!("Agent forward: received EOF");
+                break;
+            }
+            Some(ChannelMsg::Close) => {
+                log::debug!("Agent forward: channel closed");
+                break;
+            }
+            Some(other) => {
+                log::debug!("Agent forward: ignoring message {:?}", other);
+            }
+            None => {
+                log::debug!("Agent forward: channel ended");
+                break;
+            }
+        }
+    }
+
+    log::debug!("Agent forward handler finished for channel {:?}", channel.id());
+}
+
+/* </ssh agent forwarding> */
 
 /* <ssh client> */
 
 struct Client {
-    agent_channel: Option<ChannelId>,
-    buffer: Mutex<Vec<u8>>,
     host: String,
     port: u16,
 }
@@ -180,88 +145,46 @@ struct Client {
 impl Client {
     pub fn new(host: &str, port: u16) -> Self {
         Self {
-            agent_channel: None,
-            buffer: Mutex::new(Vec::new()),
             host: host.to_string(),
             port,
         }
     }
 }
 
-#[async_trait]
 impl client::Handler for Client {
     type Error = russh::Error;
 
     /// Callback to check the server's public key against a known_hosts file.
-    async fn check_server_key(
+    fn check_server_key(
         &mut self,
-        server_public_key: &ssh_key::PublicKey,
-    ) -> Result<bool, Self::Error> {
-        let result = russh_keys::check_known_hosts(&self.host, self.port, server_public_key);
-        log::debug!("check_server_key: {:?}", result);
+        server_public_key: &keys::ssh_key::PublicKey,
+    ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send {
+        let host = self.host.clone();
+        let port = self.port;
+        async move {
+            let result = keys::check_known_hosts(&host, port, server_public_key);
+            log::debug!("check_server_key: {:?}", result);
 
-        match result {
-            Ok(true) => Ok(true),
-            _ => Ok(false),
-        }
-    }
-
-    /// Callback to handle an agent forwarding channel open request.
-    async fn server_channel_open_agent_forward(
-        &mut self,
-        channel: russh::Channel<russh::client::Msg>,
-        _session: &mut russh::client::Session,
-    ) -> Result<(), Self::Error> {
-        log::debug!("server_channel_open_agent_forward: {:?}", channel);
-        self.agent_channel = Some(channel.id());
-        Ok(())
-    }
-
-    /// Callback to handle (any) data received on a channel.
-    async fn data(
-        &mut self,
-        channel: ChannelId,
-        data: &[u8],
-        session: &mut russh::client::Session,
-    ) -> Result<(), Self::Error> {
-        log::debug!("data on channel: {}", channel);
-
-        if let Some(agent_channel) = self.agent_channel {
-            if agent_channel == channel {
-                log::debug!("agent forward channel matched: {}", channel);
-
-                // Acquire the buffer lock
-                let mut buffer = self.buffer.lock().await;
-                buffer.extend_from_slice(data);
-                log::debug!("Buffer size after appending: {}", buffer.len());
-
-                // Process complete messages
-                while buffer.len() >= 4 {
-                    // Read the length prefix
-                    let msg_len = BigEndian::read_u32(&buffer[0..4]) as usize;
-
-                    if buffer.len() < msg_len + 4 {
-                        // Wait for more data...
-                        break;
-                    }
-
-                    // Extract the message
-                    let message = buffer[0..4 + msg_len].to_vec();
-                    buffer.drain(0..4 + msg_len); // Remove the processed message from the buffer
-                    log::debug!("Processing message of length: {}", msg_len);
-
-                    // Print the message
-                    parse_agent_message(&message);
-
-                    // Forward the message to the agent
-                    if let Ok(response) = exchange_ssh_agent_message(&message).await {
-                        session.data(channel, russh::CryptoVec::from_slice(&response))?;
-                    }
-                }
+            match result {
+                Ok(true) => Ok(true),
+                _ => Ok(false),
             }
         }
+    }
 
-        Ok(())
+    /// Callback to handle an agent forwarding channel opened by the server.
+    /// We spawn a background task to handle the forwarding.
+    fn server_channel_open_agent_forward(
+        &mut self,
+        channel: Channel<client::Msg>,
+        _session: &mut client::Session,
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
+        log::debug!("server_channel_open_agent_forward: {:?}", channel.id());
+
+        // Spawn a background task to handle the agent forwarding
+        tokio::spawn(handle_agent_forward_channel(channel));
+
+        async { Ok(()) }
     }
 }
 
@@ -335,9 +258,7 @@ impl RemoteExecutor for RusshExecutor {
                 .await?;
         } else {
             // Load key from agent
-            let agent_path = std::env::var("SSH_AUTH_SOCK").expect("SSH_AUTH_SOCK not set");
-            let agent_stream = tokio::net::UnixStream::connect(&agent_path).await?;
-            let mut agent_client = agent::client::AgentClient::connect(agent_stream);
+            let mut agent_client = keys::agent::client::AgentClient::connect_env().await?;
 
             let identities = agent_client.request_identities().await?;
             for (i, identity) in identities.iter().enumerate() {
@@ -346,13 +267,13 @@ impl RemoteExecutor for RusshExecutor {
             let id = identities.first().expect("No identities").clone();
 
             auth_result = session
-                .authenticate_publickey_with(&self.config.username, id, &mut agent_client)
+                .authenticate_publickey_with(&self.config.username, id, None, &mut agent_client)
                 .await?;
 
             drop(agent_client);
         }
 
-        log::debug!("Authentication code: {}", auth_result);
+        log::debug!("Authentication result: {:?}", auth_result);
 
         let mut channel = session.channel_open_session().await?;
         log::debug!("Channel opened");
