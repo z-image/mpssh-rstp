@@ -7,7 +7,7 @@ use std::time;
 
 // <russh> ////////////////////////////////////////////////////////////////
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -20,9 +20,43 @@ use tokio::sync::Mutex;
 
 /* <ssh agent forwarding> */
 
+/// Limits concurrent connections to the local SSH agent socket to avoid
+/// overwhelming its listen backlog under high parallelism.
+static AGENT_SEMAPHORE: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
+
+fn agent_semaphore() -> &'static tokio::sync::Semaphore {
+    AGENT_SEMAPHORE.get_or_init(|| tokio::sync::Semaphore::new(64))
+}
+
 /// Exchange a message with the local SSH agent.
-/// Sends the request and reads the complete response.
+/// Acquires a semaphore permit to limit concurrent agent connections, and
+/// retries on EAGAIN/WouldBlock with exponential backoff.
+// NOTE: uses inline retry logic because the generic retry() helper doesn't
+// support error-kind filtering or sub-second backoff. If more call sites need
+// similar treatment, consider generalising retry() with a predicate + config.
 async fn exchange_ssh_agent_message(data: &[u8]) -> std::io::Result<Vec<u8>> {
+    let _permit = agent_semaphore().acquire().await.unwrap();
+
+    let mut attempt = 0u32;
+    let limit = 4;
+    loop {
+        attempt += 1;
+        match exchange_ssh_agent_message_once(data).await {
+            Ok(response) => return Ok(response),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && attempt < limit => {
+                let delay_ms = 200u64 * (1 << (attempt - 1)); // 200, 400, 800
+                log::warn!(
+                    "Agent socket EAGAIN, retry {attempt}/{limit} in {delay_ms}ms"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Send a single request to the SSH agent and read the complete response.
+async fn exchange_ssh_agent_message_once(data: &[u8]) -> std::io::Result<Vec<u8>> {
     let path = std::env::var("SSH_AUTH_SOCK").expect("SSH_AUTH_SOCK not set");
     let mut stream = tokio::net::UnixStream::connect(path).await?;
 
@@ -257,7 +291,9 @@ impl RemoteExecutor for RusshExecutor {
                 .authenticate_password(&self.config.username, password)
                 .await?;
         } else {
-            // Load key from agent
+            // Load key from agent (also connects to the agent socket, so
+            // acquire the same semaphore to avoid connection storms).
+            let _agent_permit = agent_semaphore().acquire().await.unwrap();
             let mut agent_client = keys::agent::client::AgentClient::connect_env().await?;
 
             let identities = agent_client.request_identities().await?;
@@ -271,6 +307,7 @@ impl RemoteExecutor for RusshExecutor {
                 .await?;
 
             drop(agent_client);
+            drop(_agent_permit);
         }
 
         log::debug!("Authentication result: {:?}", auth_result);
@@ -308,6 +345,9 @@ impl RemoteExecutor for RusshExecutor {
 
 // <utils> ////////////////////////////////////////////////////////////////
 
+// NOTE: if more call sites need custom retry behaviour (e.g. error-kind
+// filtering, sub-second backoff), consider adding a predicate + config to
+// this helper instead of inlining retry loops elsewhere.
 async fn retry<T, F, Fut, E>(mut operation: F, op_name: &str, op_arg: &str) -> Result<T, E>
 where
     F: FnMut() -> Fut,

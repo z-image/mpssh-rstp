@@ -1180,7 +1180,7 @@ dependencies = [
 
 [[package]]
 name = "mpssh-rstp"
-version = "0.1.0"
+version = "0.94.0"
 dependencies = [
  "ansi_term",
  "anyhow",
