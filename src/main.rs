@@ -9,7 +9,20 @@
  *
  * TODO:
  *  - libssh2 backend is very slow - uses blocking I/O, needs spawn_blocking() (see ssh.rs)
- *  - Russh backend silently returns empty output (exit 0) on channel errors (e.g., very long commands)
+ *  - Russh backend: a channel that closed without exit status, or a signal, counted as exit 0
+ *   with empty output (seen with very long commands). Since 0.94.2 both report a failure
+ *   (exit 255). Unverified whether that covers every "empty output" case.
+ *  - No end-of-run summary: a run can cover fewer hosts than the list without saying so.
+ *   - 2026-08-26: 18 of 1463 hosts lost at -p 550, all "Resource temporarily unavailable
+ *   (os error 11)". Not RLIMIT_MEMLOCK as first thought: cryptovec 0.52 ignores mlock errors.
+ *   Leading hypothesis, unproven for that run: a full listen backlog on the agent socket
+ *   (gcr-ssh-agent: 5), now retried in connect_agent(). The same error hit 1 host at -p 300
+ *   on 2026-10-21, so no -p value is known to be safe.
+ *   - Easy to miss: the lost hosts were a contiguous range (s1721-s1731), which looks like
+ *   a firewall/subnet gap rather than a client-side limit; the short run finished FASTER
+ *   than the complete one; and grep counters over the output were all correct. Only
+ *   diffing answered hosts against the host list found it.
+ *   - Print "N/M hosts answered, K failed" at exit, and exit non-zero when K > 0.
  *  - Refactor print_output_with_tty() - 8 args is too many (clippy warning)
  *  - Add support for ignoring errors / timeouts per host.
  *   - I.e. when we know some hosts are flaky: try them, but with shorter timeout and ignore
@@ -215,6 +228,7 @@ pub fn print_output(
 }
 
 // Separate function that allows injecting the TTY status
+#[allow(clippy::too_many_arguments)] // refactor tracked in the TODO at the top of this file
 pub fn print_output_with_tty(
     host: &str,
     out: String,

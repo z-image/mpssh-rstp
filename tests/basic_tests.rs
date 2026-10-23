@@ -46,17 +46,10 @@ async fn test_high_parallelism_no_mlock_panic() {
 
     for i in 0..parallelism {
         let completed = Arc::clone(&completed);
-        let panicked = Arc::clone(&panicked);
 
         handles.push(tokio::spawn(async move {
-            // Use catch_unwind to detect panics from the mlock issue
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                // We need to block on the async function inside catch_unwind
-                // This is a bit awkward but necessary for panic catching
-            }));
-
-            // Actually run the SSH connection (outside catch_unwind since it's async)
-            // The panic would occur in the russh internals, which tokio will catch
+            // A panic in the russh internals is caught by tokio and seen below
+            // as a JoinError from handle.await.
             let host = if i % 2 == 0 { "localhost" } else { "127.0.0.1" };
             let (_output, _exit_code) =
                 ssh::execute(host, "echo test", "nobody", &ssh::SshBackend::Russh).await;

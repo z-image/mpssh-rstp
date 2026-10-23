@@ -9,7 +9,7 @@ use std::time;
 
 use std::sync::{Arc, OnceLock};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use byteorder::{BigEndian, ByteOrder};
 use russh::keys;
@@ -28,37 +28,23 @@ fn agent_semaphore() -> &'static tokio::sync::Semaphore {
     AGENT_SEMAPHORE.get_or_init(|| tokio::sync::Semaphore::new(64))
 }
 
-/// Exchange a message with the local SSH agent.
-/// Acquires a semaphore permit to limit concurrent agent connections, and
-/// retries on EAGAIN/WouldBlock with exponential backoff.
-// NOTE: uses inline retry logic because the generic retry() helper doesn't
-// support error-kind filtering or sub-second backoff. If more call sites need
-// similar treatment, consider generalising retry() with a predicate + config.
-async fn exchange_ssh_agent_message(data: &[u8]) -> std::io::Result<Vec<u8>> {
-    let _permit = agent_semaphore().acquire().await.unwrap();
-
-    let mut attempt = 0u32;
-    let limit = 4;
-    loop {
-        attempt += 1;
-        match exchange_ssh_agent_message_once(data).await {
-            Ok(response) => return Ok(response),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && attempt < limit => {
-                let delay_ms = 200u64 * (1 << (attempt - 1)); // 200, 400, 800
-                log::warn!(
-                    "Agent socket EAGAIN, retry {attempt}/{limit} in {delay_ms}ms"
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-            }
-            Err(e) => return Err(e),
-        }
-    }
+/// Connect to the local SSH agent ($SSH_AUTH_SOCK).
+///
+/// The agent's listen backlog can be tiny (gcr-ssh-agent uses 5), so a burst
+/// of sessions can get EAGAIN on connect even under the semaphore. Only the
+/// connect is retried; requests sent over an open connection never are.
+async fn connect_agent() -> std::io::Result<tokio::net::UnixStream> {
+    let path = std::env::var("SSH_AUTH_SOCK").map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "SSH_AUTH_SOCK not set")
+    })?;
+    retry_on_eagain("agent socket", || tokio::net::UnixStream::connect(&path)).await
 }
 
-/// Send a single request to the SSH agent and read the complete response.
-async fn exchange_ssh_agent_message_once(data: &[u8]) -> std::io::Result<Vec<u8>> {
-    let path = std::env::var("SSH_AUTH_SOCK").expect("SSH_AUTH_SOCK not set");
-    let mut stream = tokio::net::UnixStream::connect(path).await?;
+/// Exchange a message with the local SSH agent.
+/// Acquires a semaphore permit to limit concurrent agent connections.
+async fn exchange_ssh_agent_message(data: &[u8]) -> std::io::Result<Vec<u8>> {
+    let _permit = agent_semaphore().acquire().await.unwrap();
+    let mut stream = connect_agent().await?;
 
     log::debug!("exchange_ssh_agent_message: connected to agent");
 
@@ -230,6 +216,80 @@ pub struct CommandResult {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub exit_code: u32,
+    /// Why the command did not exit normally (signal, no exit status).
+    /// Printed after the output, which is kept.
+    pub failure: Option<String>,
+}
+
+/// Exit code reported when the remote command has no exit status of its own,
+/// as OpenSSH's ssh does.
+const EXIT_CODE_NO_STATUS: u32 = 255;
+
+/// Collects a remote command's output and how it ended.
+#[derive(Default)]
+struct OutcomeCollector {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    exit_status: Option<u32>,
+    exit_signal: Option<String>,
+}
+
+impl OutcomeCollector {
+    fn feed(&mut self, msg: ChannelMsg) {
+        match msg {
+            ChannelMsg::Data { data } => self.stdout.extend_from_slice(&data),
+            ChannelMsg::ExtendedData { data, .. } => self.stderr.extend_from_slice(&data),
+            ChannelMsg::ExitStatus { exit_status } => self.exit_status = Some(exit_status),
+            ChannelMsg::ExitSignal { signal_name, error_message, .. } => {
+                // russh names only some signals; the rest (XCPU, ...) are Custom.
+                let name = match signal_name {
+                    Sig::Custom(name) => name,
+                    named => format!("{named:?}"),
+                };
+                self.exit_signal = Some(if error_message.is_empty() {
+                    name
+                } else {
+                    format!("{name} ({error_message})")
+                });
+            }
+            _ => (),
+        }
+    }
+
+    fn finish(self) -> CommandResult {
+        let (exit_code, failure) = match (self.exit_signal, self.exit_status) {
+            (Some(signal), _) => (
+                EXIT_CODE_NO_STATUS,
+                Some(format!("exec: killed by signal {signal}")),
+            ),
+            (None, Some(status)) => (status, None),
+            (None, None) => (
+                EXIT_CODE_NO_STATUS,
+                Some("exec: channel closed without exit status".to_string()),
+            ),
+        };
+        CommandResult {
+            stdout: self.stdout,
+            stderr: self.stderr,
+            exit_code,
+            failure,
+        }
+    }
+}
+
+fn check_auth(result: &client::AuthResult) -> Result<()> {
+    if result.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("rejected by server")
+    }
+}
+
+fn first_identity<T>(identities: Vec<T>) -> Result<T> {
+    identities
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("agent has no identities"))
 }
 
 #[async_trait]
@@ -282,62 +342,64 @@ impl RemoteExecutor for RusshExecutor {
             "SSH connection to ",
             &remote_tuple,
         )
-        .await?;
+        .await
+        .context("ssh connect/handshake")?;
 
         // Authenticate with password if provided, otherwise use the default key.
         let auth_result;
         if let Some(password) = self.config.password.as_deref() {
             auth_result = session
                 .authenticate_password(&self.config.username, password)
-                .await?;
+                .await
+                .context("auth")?;
         } else {
             // Load key from agent (also connects to the agent socket, so
             // acquire the same semaphore to avoid connection storms).
             let _agent_permit = agent_semaphore().acquire().await.unwrap();
-            let mut agent_client = keys::agent::client::AgentClient::connect_env().await?;
+            let stream = connect_agent().await.context("agent connect")?;
+            let mut agent_client = keys::agent::client::AgentClient::connect(stream);
 
-            let identities = agent_client.request_identities().await?;
+            let identities = agent_client
+                .request_identities()
+                .await
+                .context("agent identities")?;
             for (i, identity) in identities.iter().enumerate() {
                 log::debug!("Identity {}: {:?}", i, identity);
             }
-            let id = identities.first().expect("No identities").clone();
+            let id = first_identity(identities).context("agent identities")?;
 
             auth_result = session
                 .authenticate_publickey_with(&self.config.username, id, None, &mut agent_client)
-                .await?;
+                .await
+                .context("auth")?;
 
             drop(agent_client);
             drop(_agent_permit);
         }
 
         log::debug!("Authentication result: {:?}", auth_result);
+        check_auth(&auth_result).context("auth")?;
 
-        let mut channel = session.channel_open_session().await?;
+        let mut channel = session
+            .channel_open_session()
+            .await
+            .context("channel open")?;
         log::debug!("Channel opened");
 
         // XXX: is agent socket still connected at this point?
 
-        channel.agent_forward(true).await?;
-        channel.exec(true, command).await?;
+        channel
+            .agent_forward(true)
+            .await
+            .context("agent forward request")?;
+        channel.exec(true, command).await.context("exec")?;
 
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-        let mut exit_code = 0;
-
+        let mut outcome = OutcomeCollector::default();
         while let Some(msg) = channel.wait().await {
-            match msg {
-                russh::ChannelMsg::Data { data } => stdout.extend_from_slice(&data),
-                russh::ChannelMsg::ExtendedData { data, .. } => stderr.extend_from_slice(&data),
-                russh::ChannelMsg::ExitStatus { exit_status } => exit_code = exit_status,
-                _ => (),
-            }
+            outcome.feed(msg);
         }
 
-        Ok(CommandResult {
-            stdout,
-            stderr,
-            exit_code,
-        })
+        Ok(outcome.finish())
     }
 }
 
@@ -345,9 +407,8 @@ impl RemoteExecutor for RusshExecutor {
 
 // <utils> ////////////////////////////////////////////////////////////////
 
-// NOTE: if more call sites need custom retry behaviour (e.g. error-kind
-// filtering, sub-second backoff), consider adding a predicate + config to
-// this helper instead of inlining retry loops elsewhere.
+// Coarse retry for whole connection attempts. For the narrow EAGAIN-on-connect
+// case (sub-second, error-kind filtered) see retry_on_eagain() below.
 async fn retry<T, F, Fut, E>(mut operation: F, op_name: &str, op_arg: &str) -> Result<T, E>
 where
     F: FnMut() -> Fut,
@@ -387,6 +448,42 @@ where
             }
         }
     }
+}
+
+/// Retry an I/O operation that fails with EAGAIN/WouldBlock: 4 attempts,
+/// backoff 200/400/800 ms with +-50% jitter so waiting sessions spread out.
+/// Any other error is returned at once.
+async fn retry_on_eagain<T, F, Fut>(what: &str, mut operation: F) -> std::io::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<T>>,
+{
+    let limit = 4;
+    let mut attempt = 0;
+
+    loop {
+        attempt += 1;
+
+        match operation().await {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && attempt < limit => {
+                let delay = jittered(200 << (attempt - 1));
+                log::warn!("{what} EAGAIN, retry {attempt}/{limit} in {}ms", delay.as_millis());
+                tokio::time::sleep(delay).await;
+            }
+            result => return result,
+        }
+    }
+}
+
+/// base_ms +-50%. Each RandomState::new() gets different keys, so the delay
+/// varies between calls; not cryptographic randomness.
+fn jittered(base_ms: u64) -> time::Duration {
+    use std::hash::{BuildHasher, Hasher};
+
+    let random = std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish();
+    time::Duration::from_millis(base_ms / 2 + random % (base_ms + 1))
 }
 
 // </utils> ///////////////////////////////////////////////////////////////
@@ -477,15 +574,25 @@ pub async fn execute(
     };
 
     match result {
-        Ok(res) => {
-            let combined = [&res.stdout[..], &res.stderr[..]].concat();
-            let output_str = String::from_utf8_lossy(&combined).to_string();
-            (Some(output_str), res.exit_code as i32)
-        }
+        Ok(res) => render_result(res),
         Err(e) => {
-            (Some(e.to_string()), 1)
+            // {:#} prints the whole chain: "agent connect: Resource temporarily unavailable"
+            (Some(format!("{e:#}")), 1)
         }
     }
+}
+
+/// Output as printed (stdout, then stderr, then any failure line) and exit code.
+fn render_result(res: CommandResult) -> (Option<String>, i32) {
+    let combined = [&res.stdout[..], &res.stderr[..]].concat();
+    let mut output = String::from_utf8_lossy(&combined).to_string();
+    if let Some(failure) = res.failure {
+        if !output.is_empty() && !output.ends_with('\n') {
+            output.push('\n');
+        }
+        output.push_str(&failure);
+    }
+    (Some(output), res.exit_code as i32)
 }
 
 pub struct LibSsh2Executor {
@@ -664,6 +771,7 @@ pub async fn execute_libssh2(
         stdout: out.into_bytes(),
         stderr: Vec::new(),
         exit_code: exit_status as u32,
+        failure: None,
     })
 }
 
@@ -681,7 +789,7 @@ mod tests {
         let result = retry(
             || async {
                 log::info!("Attempting operation");
-                Err::<(), _>(std::io::Error::new(std::io::ErrorKind::Other, "failed"))
+                Err::<(), _>(std::io::Error::other("failed"))
             },
             "op_test:",
             "op_arg",
@@ -693,5 +801,217 @@ mod tests {
         assert!(logs_contain("op_test:op_arg error 2/4, will retry in 4s"));
         assert!(logs_contain("op_test:op_arg error 3/4, will retry in 9s"));
         assert!(logs_contain("op_test:op_arg failure 4/4: failed"));
+    }
+
+    /* retry_on_eagain() */
+
+    use std::io::ErrorKind::{Other, WouldBlock};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    async fn count_attempts(fail_first: usize, kind: std::io::ErrorKind) -> (std::io::Result<()>, usize) {
+        let attempts = AtomicUsize::new(0);
+        let result = retry_on_eagain("test", || async {
+            if attempts.fetch_add(1, Ordering::SeqCst) < fail_first {
+                Err(std::io::Error::new(kind, "test"))
+            } else {
+                Ok(())
+            }
+        })
+        .await;
+        (result, attempts.load(Ordering::SeqCst))
+    }
+
+    #[tokio::test]
+    async fn test_retry_on_eagain_recovers() {
+        let (result, attempts) = count_attempts(2, WouldBlock).await;
+        assert!(result.is_ok());
+        assert_eq!(attempts, 3);
+    }
+
+    #[tokio::test]
+    async fn test_retry_on_eagain_other_error_fails_at_once() {
+        let (result, attempts) = count_attempts(usize::MAX, Other).await;
+        assert_eq!(result.unwrap_err().kind(), Other);
+        assert_eq!(attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn test_retry_on_eagain_gives_up() {
+        let (result, attempts) = count_attempts(usize::MAX, WouldBlock).await;
+        assert_eq!(result.unwrap_err().kind(), WouldBlock);
+        assert_eq!(attempts, 4);
+    }
+
+    /// A real Unix socket whose accept queue is full returns EAGAIN on connect
+    /// (the agent case); the retry must get through once the listener drains it.
+    #[tokio::test]
+    async fn test_retry_on_eagain_full_backlog() {
+        use std::os::unix::io::AsRawFd;
+
+        // A directory only this test owns (create_dir fails if the name exists);
+        // the guard removes it on every exit, including a failed assertion.
+        struct OwnedDir(std::path::PathBuf);
+        impl Drop for OwnedDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        // /tmp, not temp_dir(): a long $TMPDIR exceeds the 108-byte socket path limit.
+        let dir_path = std::path::Path::new("/tmp")
+            .join(format!("mpssh-test-{}-{}", std::process::id(), nanos));
+        std::fs::create_dir(&dir_path).unwrap();
+        let dir = OwnedDir(dir_path);
+        let path = dir.0.join("agent.sock");
+        let std_listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        // Calling listen() again on a listening socket sets a new backlog: 0 = one pending connection.
+        assert_eq!(unsafe { libc::listen(std_listener.as_raw_fd(), 0) }, 0);
+        std_listener.set_nonblocking(true).unwrap();
+        let listener = tokio::net::UnixListener::from_std(std_listener).unwrap();
+
+        // Fill the accept queue until connect fails with EAGAIN; keep those connections open.
+        let mut queued = Vec::new();
+        loop {
+            match tokio::net::UnixStream::connect(&path).await {
+                Ok(stream) => queued.push(stream),
+                Err(e) if e.kind() == WouldBlock => break,
+                Err(e) => panic!("unexpected connect error: {}", e),
+            }
+            assert!(queued.len() < 16, "backlog never filled: the test would not exercise the retry");
+        }
+
+        // Drain the queue only after the first attempt has failed.
+        let acceptor = tokio::spawn(async move {
+            tokio::time::sleep(time::Duration::from_millis(50)).await;
+            let mut accepted = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                accepted.push(stream);
+            }
+        });
+
+        let attempts = AtomicUsize::new(0);
+        let result = retry_on_eagain("test", || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            tokio::net::UnixStream::connect(&path)
+        })
+        .await;
+
+        acceptor.abort();
+        assert!(result.is_ok(), "connect failed: {:?}", result.err());
+        assert!(attempts.load(Ordering::SeqCst) >= 2, "first attempt did not hit EAGAIN");
+    }
+
+    #[test]
+    fn test_jittered_stays_within_half() {
+        for _ in 0..1000 {
+            let ms = jittered(200).as_millis();
+            assert!((100..=300).contains(&ms), "{}", ms);
+        }
+    }
+
+    /* OutcomeCollector */
+
+    fn collect(msgs: Vec<ChannelMsg>) -> CommandResult {
+        let mut outcome = OutcomeCollector::default();
+        for msg in msgs {
+            outcome.feed(msg);
+        }
+        outcome.finish()
+    }
+
+    fn data(bytes: &[u8]) -> ChannelMsg {
+        ChannelMsg::Data { data: CryptoVec::from_slice(bytes) }
+    }
+
+    #[test]
+    fn test_outcome_exit_zero_without_output_is_success() {
+        let res = collect(vec![ChannelMsg::ExitStatus { exit_status: 0 }, ChannelMsg::Eof]);
+        assert_eq!(res.exit_code, 0);
+        assert!(res.failure.is_none());
+        assert!(res.stdout.is_empty());
+    }
+
+    #[test]
+    fn test_outcome_nonzero_exit_is_not_a_failure() {
+        let res = collect(vec![data(b"out\n"), ChannelMsg::ExitStatus { exit_status: 3 }]);
+        assert_eq!(res.exit_code, 3);
+        assert!(res.failure.is_none());
+    }
+
+    #[test]
+    fn test_outcome_no_exit_status_keeps_output() {
+        let res = collect(vec![data(b"partial"), ChannelMsg::Eof, ChannelMsg::Close]);
+        assert_eq!(res.exit_code, EXIT_CODE_NO_STATUS);
+        assert_eq!(res.failure.as_deref(), Some("exec: channel closed without exit status"));
+        assert_eq!(res.stdout, b"partial");
+    }
+
+    #[test]
+    fn test_outcome_signal_keeps_output() {
+        let res = collect(vec![
+            ChannelMsg::ExtendedData { data: CryptoVec::from_slice(b"dying\n"), ext: 1 },
+            ChannelMsg::ExitSignal {
+                signal_name: Sig::TERM,
+                core_dumped: false,
+                error_message: String::new(),
+                lang_tag: String::new(),
+            },
+        ]);
+        assert_eq!(res.exit_code, EXIT_CODE_NO_STATUS);
+        assert_eq!(res.failure.as_deref(), Some("exec: killed by signal TERM"));
+        assert_eq!(res.stderr, b"dying\n");
+    }
+
+    #[test]
+    fn test_outcome_custom_signal_with_message_keeps_output() {
+        let res = collect(vec![
+            data(b"busy\n"),
+            ChannelMsg::ExitSignal {
+                signal_name: Sig::Custom("XCPU".to_string()),
+                core_dumped: false,
+                error_message: "CPU time limit exceeded".to_string(),
+                lang_tag: String::new(),
+            },
+        ]);
+        assert_eq!(res.exit_code, EXIT_CODE_NO_STATUS);
+        assert_eq!(
+            res.failure.as_deref(),
+            Some("exec: killed by signal XCPU (CPU time limit exceeded)")
+        );
+        assert_eq!(res.stdout, b"busy\n");
+    }
+
+    #[test]
+    fn test_render_result_appends_failure_on_its_own_line() {
+        let (output, code) = render_result(collect(vec![data(b"partial")]));
+        assert_eq!(output.as_deref(), Some("partial\nexec: channel closed without exit status"));
+        assert_eq!(code, 255);
+
+        let (output, _) = render_result(collect(vec![]));
+        assert_eq!(output.as_deref(), Some("exec: channel closed without exit status"));
+    }
+
+    /* login checks */
+
+    #[test]
+    fn test_check_auth_rejects_failure() {
+        assert!(check_auth(&client::AuthResult::Success).is_ok());
+        let rejected = client::AuthResult::Failure {
+            remaining_methods: MethodSet::empty(),
+            partial_success: false,
+        };
+        assert_eq!(check_auth(&rejected).unwrap_err().to_string(), "rejected by server");
+    }
+
+    #[test]
+    fn test_first_identity_empty_agent_is_an_error() {
+        assert_eq!(first_identity(vec![7, 8]).unwrap(), 7);
+        assert_eq!(
+            first_identity(Vec::<u8>::new()).unwrap_err().to_string(),
+            "agent has no identities"
+        );
     }
 }
